@@ -1,0 +1,23 @@
+2026-05-09 16:28:50,080 [ERROR] run_bot: Fatal error: ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env
+Traceback (most recent call last):
+  File "C:\Users\Henil\projects\stock-trading\run_bot.py", line 428, in main
+    run(symbol, config, skip_entry_signal=args.skip_entry_signal)
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Henil\projects\stock-trading\run_bot.py", line 211, in run
+    client = AlpacaClient(config)
+  File "C:\Users\Henil\projects\stock-trading\alpaca_client.py", line 35, in __init__
+    config.alpaca.validate()
+    ~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Henil\projects\stock-trading\config.py", line 20, in validate
+    raise ValueError(
+        "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env"
+    )
+ValueError: ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env
+2026-05-09 16:29:53,591 [INFO] run_bot: Paper account  equity=$100000.00  buying_power=$200000.00
+2026-05-09 16:29:53,592 [INFO] run_bot: === Running premarket filters for BBAI ===
+2026-05-09 16:29:54,668 [WARNING] strategy: RVOL calculation failed for BBAI: {"message":"subscription does not permit querying recent SIP data"}
+
+2026-05-09 16:36:40,116 [INFO] run_bot: Paper account  equity=$100000.00  buying_power=$200000.00
+2026-05-09 16:36:40,117 [INFO] run_bot: === Running premarket filters for EXOD ===
+2026-05-09 16:36:41,114 [WARNING] strategy: RVOL calculation failed for EXOD: {"message":"subscription does not permit querying recent SIP data"}
+
