@@ -17,8 +17,6 @@ from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
     GetOrdersRequest,
     MarketOrderRequest,
-    StopOrderRequest,
-    TrailingStopOrderRequest,
 )
 
 from config import Config
@@ -130,45 +128,6 @@ class AlpacaClient:
             side.value,
             qty,
             symbol,
-            order.id,
-        )
-        return order
-
-    def place_trailing_stop(
-        self, symbol: str, qty: int, trail_percent: float
-    ):
-        """Place a native Alpaca trailing-stop sell order (paper account)."""
-        req = TrailingStopOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-            trail_percent=trail_percent,
-        )
-        order = self._trading.submit_order(req)
-        logger.info(
-            "Trailing stop submitted: SELL %d %s trail=%.1f%% — id=%s",
-            qty,
-            symbol,
-            trail_percent,
-            order.id,
-        )
-        return order
-
-    def place_stop_order(self, symbol: str, qty: int, stop_price: float):
-        req = StopOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-            stop_price=round(stop_price, 2),
-        )
-        order = self._trading.submit_order(req)
-        logger.info(
-            "Stop order submitted: SELL %d %s stop=$%.2f — id=%s",
-            qty,
-            symbol,
-            stop_price,
             order.id,
         )
         return order

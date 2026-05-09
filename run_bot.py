@@ -68,7 +68,6 @@ def monitor_position(
     config: Config,
     trade: TradeRecord,
     sizing: PositionSizing,
-    trailing_stop_placed: bool,
 ) -> None:
     log = logging.getLogger("monitor")
     symbol = trade.symbol
@@ -91,13 +90,13 @@ def monitor_position(
 
         position = client.get_position(symbol)
 
-        # Position closed externally — Alpaca's trailing stop was triggered.
+        # Position closed externally — position no longer exists.
         if position is None:
-            log.info("%s: position closed externally (trailing stop filled)", symbol)
+            log.info("%s: position closed externally", symbol)
             _record_exit(
                 trade=trade,
                 exit_price=sizing.entry_price,  # rough fallback
-                reason="trailing_stop_filled",
+                reason="position_closed_externally",
                 trade_logger=trade_logger,
                 client=client,
                 symbol=symbol,
@@ -128,8 +127,8 @@ def monitor_position(
             elapsed / 60,
         )
 
-        # Hard stop hit — close manually (belt-and-suspenders if native order failed)
-        if not trailing_stop_placed and risk_mgr.is_stop_hit(current_price, current_stop):
+        # Hard stop hit — close manually.
+        if risk_mgr.is_stop_hit(current_price, current_stop):
             log.warning(
                 "%s: stop hit  price=$%.2f  stop=$%.2f — closing",
                 symbol,
@@ -204,7 +203,12 @@ def _record_exit(
 # Core execution flow                                                 #
 # ------------------------------------------------------------------ #
 
-def run(symbol: str, config: Config, skip_entry_signal: bool = False) -> None:
+def run(
+    symbol: str,
+    config: Config,
+    skip_filters: bool = False,
+    skip_entry_signal: bool = False,
+) -> None:
     log = logging.getLogger("run_bot")
 
     trade_logger = TradeLogger(config.log_dir)
@@ -218,16 +222,32 @@ def run(symbol: str, config: Config, skip_entry_signal: bool = False) -> None:
     log.info("Paper account  equity=$%.2f  buying_power=$%.2f", equity, float(account.buying_power))
 
     # ---- Premarket filters ----------------------------------------
-    log.info("=== Running premarket filters for %s ===", symbol)
-    filter_result: FilterResult = strategy.run_filters(symbol)
-    print(f"\n[{symbol}] Filter results:\n{filter_result.summary()}")
+    filter_result: FilterResult
+    if not skip_filters:
+        log.info("=== Running premarket filters for %s ===", symbol)
+        filter_result = strategy.run_filters(symbol)
+        print(f"\n[{symbol}] Filter results:\n{filter_result.summary()}")
 
-    if not filter_result.passed:
-        print(f"\n{symbol} did not pass all filters — no trade placed.\n")
-        trade_logger.print_summary()
-        return
+        if not filter_result.passed:
+            print(f"\n{symbol} did not pass all filters — no trade placed.\n")
+            trade_logger.print_summary()
+            return
 
-    log.info("%s passed all filters.", symbol)
+        log.info("%s passed all filters.", symbol)
+    else:
+        log.warning("=== Skipping premarket filters for %s ===", symbol)
+        filter_result = FilterResult(passed=True)
+        try:
+            quote = client.get_latest_quote(symbol)
+            filter_result.price = quote["mid"]
+        except Exception as exc:
+            log.error(
+                "Could not fetch latest quote for %s while skipping filters: %s",
+                symbol,
+                exc,
+            )
+            print(f"\n{symbol}: could not fetch latest quote — no trade placed.\n")
+            return
 
     # ---- Entry signal confirmation --------------------------------
     if not skip_entry_signal:
@@ -279,23 +299,16 @@ def run(symbol: str, config: Config, skip_entry_signal: bool = False) -> None:
     entry_order = client.place_market_order(symbol, sizing.shares, OrderSide.BUY)
     log.info("Entry order submitted: id=%s", entry_order.id)
 
-    # Paper fills are near-instant; wait briefly before placing the stop
+    # Paper fills are near-instant; wait briefly and then manage stop loss manually.
     time.sleep(2)
 
-    trailing_stop_placed = False
     trail_pct = config.risk.trailing_stop_pct * 100
-    try:
-        client.place_trailing_stop(symbol, sizing.shares, trail_pct)
-        trailing_stop_placed = True
-    except Exception as exc:
-        log.warning(
-            "Could not place Alpaca trailing stop (%s) — will manage stop manually.", exc
-        )
-        # Fall back to a plain stop order at the initial stop price
-        try:
-            client.place_stop_order(symbol, sizing.shares, sizing.initial_stop)
-        except Exception as exc2:
-            log.warning("Plain stop order also failed (%s) — monitoring manually.", exc2)
+    log.info(
+        "Managing stops manually for %s — initial stop=$%.2f, trail=%.0f%%",
+        symbol,
+        sizing.initial_stop,
+        trail_pct,
+    )
 
     # ---- Record entry --------------------------------------------
     trade = TradeRecord(
@@ -333,7 +346,6 @@ def run(symbol: str, config: Config, skip_entry_signal: bool = False) -> None:
             config=config,
             trade=trade,
             sizing=sizing,
-            trailing_stop_placed=trailing_stop_placed,
         )
     except KeyboardInterrupt:
         log.info("Interrupted — closing %s", symbol)
@@ -388,6 +400,11 @@ def main() -> None:
         help="Max position size as %% of account equity, e.g. --max-position 2",
     )
     parser.add_argument(
+        "--skip-filters",
+        action="store_true",
+        help="Bypass premarket filter checks for manually selected tickers",
+    )
+    parser.add_argument(
         "--skip-entry-signal",
         action="store_true",
         help="Bypass momentum confirmation (for testing filter logic only)",
@@ -425,7 +442,12 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        run(symbol, config, skip_entry_signal=args.skip_entry_signal)
+        run(
+            symbol,
+            config,
+            skip_filters=args.skip_filters,
+            skip_entry_signal=args.skip_entry_signal,
+        )
     except KeyboardInterrupt:
         pass
     except Exception as exc:

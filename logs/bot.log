@@ -21,3 +21,33 @@ ValueError: ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env
 2026-05-09 16:36:40,117 [INFO] run_bot: === Running premarket filters for EXOD ===
 2026-05-09 16:36:41,114 [WARNING] strategy: RVOL calculation failed for EXOD: {"message":"subscription does not permit querying recent SIP data"}
 
+2026-05-09 17:18:04,479 [INFO] run_bot: Paper account  equity=$100000.00  buying_power=$200000.00
+2026-05-09 17:18:04,479 [INFO] run_bot: === Running premarket filters for LNSR ===
+2026-05-09 17:18:05,386 [WARNING] strategy: RVOL calculation failed for LNSR: {"message":"subscription does not permit querying recent SIP data"}
+
+2026-05-09 17:41:58,488 [INFO] run_bot: Paper account  equity=$1000.00  buying_power=$1000.00
+2026-05-09 17:41:58,489 [WARNING] run_bot: === Skipping premarket filters for LNSR ===
+2026-05-09 17:41:58,893 [WARNING] run_bot: --skip-entry-signal active — bypassing momentum check
+2026-05-09 17:41:59,063 [INFO] run_bot: LNSR: entry signal confirmed — skip_entry_signal_flag
+2026-05-09 17:41:59,065 [INFO] run_bot: Position sizing  shares=3  entry=$5.67  stop=$5.27  risk=$1.19  value=$17.00
+2026-05-09 17:41:59,219 [INFO] alpaca_client: Market order submitted: buy 3 LNSR — id=c236aa4e-68f4-4b9a-a491-56c6bb3d541b
+2026-05-09 17:41:59,220 [INFO] run_bot: Entry order submitted: id=c236aa4e-68f4-4b9a-a491-56c6bb3d541b
+2026-05-09 17:42:01,285 [WARNING] run_bot: Could not place Alpaca trailing stop ({"code":40310000,"message":"account is not allowed to short"}) — will manage stop manually.
+2026-05-09 17:42:01,351 [WARNING] run_bot: Plain stop order also failed ({"code":40310000,"existing_order_id":"c236aa4e-68f4-4b9a-a491-56c6bb3d541b","message":"potential wash trade detected. use complex orders","reject_reason":"opposite side market/stop order exists"}) — monitoring manually.
+2026-05-09 17:42:01,362 [INFO] trade_logger: ENTRY  LNSR    $5.67 × 3  stop=$5.27
+2026-05-09 17:42:01,366 [INFO] monitor: Monitoring LNSR | entry=$5.67  stop=$5.27  trail=5%  max_hold=120m
+2026-05-09 17:42:01,444 [INFO] monitor: LNSR: position closed externally (trailing stop filled)
+2026-05-09 17:42:01,526 [INFO] trade_logger: EXIT   LNSR    $5.67  reason=trailing_stop_filled    PnL=$+0.00 (+0.0%)
+2026-05-09 17:50:29,522 [INFO] run_bot: Paper account  equity=$1000.00  buying_power=$982.90
+2026-05-09 17:50:29,524 [WARNING] run_bot: === Skipping premarket filters for RXT ===
+2026-05-09 17:50:29,900 [WARNING] run_bot: --skip-entry-signal active — bypassing momentum check
+2026-05-09 17:50:29,960 [INFO] run_bot: RXT: entry signal confirmed — skip_entry_signal_flag
+2026-05-09 17:50:29,960 [INFO] run_bot: Position sizing  shares=91  entry=$5.46  stop=$5.08  risk=$34.78  value=$496.86
+2026-05-09 17:50:30,016 [INFO] alpaca_client: Market order submitted: buy 91 RXT — id=2f9ee444-786b-44f7-a6f1-bf1bf224507c
+2026-05-09 17:50:30,016 [INFO] run_bot: Entry order submitted: id=2f9ee444-786b-44f7-a6f1-bf1bf224507c
+2026-05-09 17:50:32,069 [WARNING] run_bot: Could not place Alpaca trailing stop ({"code":40310000,"message":"account is not allowed to short"}) — will manage stop manually.
+2026-05-09 17:50:32,121 [WARNING] run_bot: Plain stop order also failed ({"code":40310000,"existing_order_id":"2f9ee444-786b-44f7-a6f1-bf1bf224507c","message":"potential wash trade detected. use complex orders","reject_reason":"opposite side market/stop order exists"}) — monitoring manually.
+2026-05-09 17:50:32,123 [INFO] trade_logger: ENTRY  RXT     $5.46 × 91  stop=$5.08
+2026-05-09 17:50:32,124 [INFO] monitor: Monitoring RXT | entry=$5.46  stop=$5.08  trail=5%  max_hold=120m
+2026-05-09 17:50:32,173 [INFO] monitor: RXT: position closed externally (trailing stop filled)
+2026-05-09 17:50:32,245 [INFO] trade_logger: EXIT   RXT     $5.46  reason=trailing_stop_filled    PnL=$+0.00 (+0.0%)

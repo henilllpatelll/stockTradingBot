@@ -40,13 +40,13 @@ class FilterConfig:
 @dataclass
 class RiskConfig:
     # Max fraction of account equity allocated to one trade
-    max_position_pct: float = 0.02
+    max_position_pct: float = 0.50
     # Hard stop loss below entry (e.g. 0.07 = 7%)
     stop_loss_pct: float = 0.07
     # Trailing stop that follows the price upward (e.g. 0.05 = 5%)
     trailing_stop_pct: float = 0.05
     # Daily loss ceiling — no new trades once hit
-    max_daily_loss_pct: float = 0.06
+    max_daily_loss_pct: float = 0.10
 
 
 @dataclass
@@ -59,7 +59,7 @@ class Config:
     # Safety guard — changing this to False raises immediately.
     paper_only: bool = True
     # Seconds between position-monitoring polls
-    monitor_interval_seconds: int = 30
+    monitor_interval_seconds: int = 1.5
     # Force-close position after this many minutes regardless of P&L
     max_hold_minutes: int = 120
 
