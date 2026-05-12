@@ -6,7 +6,7 @@ Usage:
 
 Examples:
     python run_bot.py BBAI
-    python run_bot.py MSTR --stop-loss 8 --trail 6
+    python run_bot.py MSTR
     python run_bot.py --summary
 """
 
@@ -19,11 +19,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 from alpaca.trading.enums import OrderSide
 
 from alpaca_client import AlpacaClient
 from config import Config
-from risk_manager import PositionSizing, RiskManager
+from risk_manager import PositionSizing, RiskManager, TakeProfitTargets
 from strategy import EntrySignal, FilterResult, PremarketCatalystStrategy
 from trade_logger import TradeLogger, TradeRecord
 
@@ -56,6 +57,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _limit_sell(client: AlpacaClient, symbol: str, qty: int, log: logging.Logger) -> None:
+    quote = client.get_latest_quote(symbol)
+    limit = round(quote["bid"] - 0.05, 2)
+    log.info("%s: limit sell %d shares @ $%.2f (bid-$0.05)", symbol, qty, limit)
+    client.place_limit_order(symbol, qty, OrderSide.SELL, limit)
+
+
 # ------------------------------------------------------------------ #
 # Position monitor loop                                               #
 # ------------------------------------------------------------------ #
@@ -77,12 +85,35 @@ def monitor_position(
     max_secs = config.max_hold_minutes * 60
 
     log.info(
-        "Monitoring %s | entry=$%.2f  stop=$%.2f  trail=%.0f%%  max_hold=%dm",
+        "Monitoring %s | entry=$%.2f  stop=$%.2f  trail=candle-low  max_hold=%dm",
         symbol,
         sizing.entry_price,
         current_stop,
-        config.risk.trailing_stop_pct * 100,
         config.max_hold_minutes,
+    )
+
+    # Wait for the position to appear in Alpaca's API before polling.
+    # Paper fills are near-instant but the positions endpoint can lag by a few seconds.
+    _confirm_deadline = time.monotonic() + 15
+    while client.get_position(symbol) is None:
+        if time.monotonic() > _confirm_deadline:
+            log.error("%s: position never appeared after entry — aborting monitor", symbol)
+            return
+        time.sleep(1)
+
+    targets = risk_mgr.calculate_targets(sizing.entry_price, sizing.initial_stop)
+    shares_remaining = sizing.shares
+    t1_hit = False
+    t2_hit = False
+    last_bar_time = None
+    last_candle_minute = None
+    log.info(
+        "%s: targets  T1=$%.2f (1:1, sell 50%%)  T2=$%.2f (before $%.2f psych, sell 25%%)"
+        "  T3=candle closes below 9-EMA",
+        symbol,
+        targets.t1,
+        targets.t2,
+        targets.t2_psych,
     )
 
     while True:
@@ -93,6 +124,7 @@ def monitor_position(
         # Position closed externally — position no longer exists.
         if position is None:
             log.info("%s: position closed externally", symbol)
+            trade.shares = shares_remaining
             _record_exit(
                 trade=trade,
                 exit_price=sizing.entry_price,  # rough fallback
@@ -106,39 +138,109 @@ def monitor_position(
         current_price = float(position.current_price)
         unrealized = float(position.unrealized_pl)
 
-        # Update manual trailing stop (even when Alpaca stop is active, track it)
-        new_stop = risk_mgr.update_trailing_stop(current_price, current_stop)
-        if new_stop > current_stop:
-            log.info(
-                "%s: trailing stop raised $%.2f → $%.2f",
-                symbol,
-                current_stop,
-                new_stop,
-            )
-            current_stop = new_stop
-
         log.info(
-            "%s  price=$%.2f  stop=$%.2f  unrealized=${:+.2f}  elapsed=%.0fm".format(
+            "%s  price=$%.2f  stop=$%.2f  unrealized=${:+.2f}  shares=%d  elapsed=%.0fm".format(
                 unrealized
             ),
             symbol,
             current_price,
             current_stop,
+            shares_remaining,
             elapsed / 60,
         )
 
-        # Hard stop hit — close manually.
+        # ---- Fetch bars on each new completed candle (top of each minute) ----
+        current_minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        if current_minute != last_candle_minute:
+            try:
+                bars = client.get_intraday_bars(symbol, lookback_hours=1)
+                last_candle_minute = current_minute
+                if len(bars) >= 2:
+                    new_bar_time = bars.index[-1]
+                    if new_bar_time != last_bar_time:
+                        last_bar_time = new_bar_time
+                        if t1_hit:
+                            # ATR(14) from recent 1-min bars
+                            prev_close = bars["close"].shift(1)
+                            tr = pd.concat([
+                                bars["high"] - bars["low"],
+                                (bars["high"] - prev_close).abs(),
+                                (bars["low"]  - prev_close).abs(),
+                            ], axis=1).max(axis=1)
+                            atr = float(tr.rolling(14, min_periods=1).mean().iloc[-1])
+                            prev_candle_low = float(bars["low"].iloc[-1])
+                            candidate = round(prev_candle_low - atr * config.risk.atr_multiplier, 4)
+                            if candidate > current_stop:
+                                log.info(
+                                    "%s: stop raised  candle_low=$%.2f  atr=$%.4f  new_stop=$%.2f -> $%.2f",
+                                    symbol, prev_candle_low, atr, current_stop, candidate,
+                                )
+                                current_stop = candidate
+
+                    # T3: sell remaining if a candle closes below the 9-EMA
+                    if t1_hit and t2_hit and len(bars) >= 9:
+                        ema9 = float(bars["close"].ewm(span=9, adjust=False).mean().iloc[-1])
+                        last_close = float(bars["close"].iloc[-1])
+                        if last_close < ema9:
+                            log.info(
+                                "%s: T3 candle closed below 9-EMA ($%.2f < $%.2f) — selling remaining %d shares",
+                                symbol, last_close, ema9, shares_remaining,
+                            )
+                            _limit_sell(client, symbol, shares_remaining, log)
+                            trade.shares = shares_remaining
+                            _record_exit(
+                                trade=trade,
+                                exit_price=current_price,
+                                reason="take_profit_t3_ema_close",
+                                trade_logger=trade_logger,
+                                client=client,
+                                symbol=symbol,
+                            )
+                            break
+            except Exception as exc:
+                log.warning("%s: bar fetch failed: %s", symbol, exc)
+
+        # ---- Take-profit T1: sell 50% at 1:1 risk/reward ----
+        if not t1_hit and current_price >= targets.t1:
+            t1_shares = shares_remaining // 2
+            if t1_shares > 0:
+                log.info(
+                    "%s: T1 hit  price=$%.2f >= $%.2f — selling %d shares (50%%)",
+                    symbol, current_price, targets.t1, t1_shares,
+                )
+                try:
+                    _limit_sell(client, symbol, t1_shares, log)
+                    shares_remaining -= t1_shares
+                except Exception as exc:
+                    log.error("%s: T1 sell failed: %s", symbol, exc)
+            t1_hit = True
+
+        # ---- Take-profit T2: sell 50% of remainder just before psych level ----
+        elif t1_hit and not t2_hit and current_price >= targets.t2:
+            t2_shares = shares_remaining // 2
+            if t2_shares > 0:
+                log.info(
+                    "%s: T2 hit  price=$%.2f >= $%.2f (before $%.2f) — selling %d shares",
+                    symbol, current_price, targets.t2, targets.t2_psych, t2_shares,
+                )
+                try:
+                    _limit_sell(client, symbol, t2_shares, log)
+                    shares_remaining -= t2_shares
+                except Exception as exc:
+                    log.error("%s: T2 sell failed: %s", symbol, exc)
+            t2_hit = True
+
+        # ---- Hard stop hit — close remaining shares ----
         if risk_mgr.is_stop_hit(current_price, current_stop):
             log.warning(
-                "%s: stop hit  price=$%.2f  stop=$%.2f — closing",
-                symbol,
-                current_price,
-                current_stop,
+                "%s: stop hit  price=$%.2f  stop=$%.2f — closing %d shares",
+                symbol, current_price, current_stop, shares_remaining,
             )
             try:
-                client.close_position(symbol)
+                _limit_sell(client, symbol, shares_remaining, log)
             except Exception:
                 pass
+            trade.shares = shares_remaining
             _record_exit(
                 trade=trade,
                 exit_price=current_price,
@@ -149,16 +251,18 @@ def monitor_position(
             )
             break
 
-        # Max hold time reached
+        # ---- Max hold time reached ----
         if elapsed >= max_secs:
             log.info(
-                "%s: max hold time (%dm) reached — closing", symbol, config.max_hold_minutes
+                "%s: max hold time (%dm) reached — closing %d shares",
+                symbol, config.max_hold_minutes, shares_remaining,
             )
             try:
                 client.cancel_orders_for_symbol(symbol)
-                client.close_position(symbol)
+                _limit_sell(client, symbol, shares_remaining, log)
             except Exception:
                 pass
+            trade.shares = shares_remaining
             _record_exit(
                 trade=trade,
                 exit_price=current_price,
@@ -296,18 +400,27 @@ def run(
         return
 
     # ---- Execute entry -------------------------------------------
-    entry_order = client.place_market_order(symbol, sizing.shares, OrderSide.BUY)
-    log.info("Entry order submitted: id=%s", entry_order.id)
+    entry_quote = client.get_latest_quote(symbol)
+    entry_limit = round(entry_quote["ask"] + 0.05, 2)
+    entry_order = client.place_limit_order(symbol, sizing.shares, OrderSide.BUY, entry_limit)
+    log.info("Entry limit order submitted: id=%s  limit=$%.2f", entry_order.id, entry_limit)
 
-    # Paper fills are near-instant; wait briefly and then manage stop loss manually.
-    time.sleep(2)
+    fill_deadline = time.monotonic() + 30
+    while True:
+        order = client.get_order(entry_order.id)
+        if order is not None and order.status.value == "filled":
+            log.info("Entry order filled: id=%s", entry_order.id)
+            break
+        if time.monotonic() > fill_deadline:
+            log.warning("%s: entry limit did not fill within 30s — cancelling", symbol)
+            client.cancel_order(entry_order.id)
+            return
+        time.sleep(1)
 
-    trail_pct = config.risk.trailing_stop_pct * 100
     log.info(
-        "Managing stops manually for %s — initial stop=$%.2f, trail=%.0f%%",
+        "Managing stops manually for %s — initial stop=$%.2f, trail=candle-low",
         symbol,
         sizing.initial_stop,
-        trail_pct,
     )
 
     # ---- Record entry --------------------------------------------
@@ -317,7 +430,7 @@ def run(
         entry_price=signal.entry_price,
         shares=sizing.shares,
         initial_stop=sizing.initial_stop,
-        trail_pct=config.risk.trailing_stop_pct,
+        trail_pct=0.0,
         rvol=signal.rvol,
         change_pct=signal.change_pct,
     )
@@ -330,8 +443,8 @@ def run(
         f"  Entry price : ${signal.entry_price:.2f}\n"
         f"  Shares      : {sizing.shares}\n"
         f"  Position    : ${sizing.position_value:.2f}\n"
-        f"  Stop loss   : ${sizing.initial_stop:.2f}  ({config.risk.stop_loss_pct * 100:.0f}%)\n"
-        f"  Trail stop  : {trail_pct:.0f}%\n"
+        f"  Stop loss   : ${sizing.initial_stop:.2f}  (-${config.risk.initial_stop_offset:.2f})\n"
+        f"  Trail stop  : candle-low\n"
         f"  Max risk    : ${sizing.risk_amount:.2f}\n"
         f"  Signal      : {signal.reason}\n"
         f"{'═' * 52}\n"
@@ -351,7 +464,9 @@ def run(
         log.info("Interrupted — closing %s", symbol)
         try:
             client.cancel_orders_for_symbol(symbol)
-            client.close_position(symbol)
+            exit_quote = client.get_latest_quote(symbol)
+            exit_limit = round(exit_quote["bid"] - 0.05, 2)
+            client.place_limit_order(symbol, trade.shares, OrderSide.SELL, exit_limit)
             _record_exit(
                 trade=trade,
                 exit_price=signal.entry_price,
@@ -382,24 +497,6 @@ def main() -> None:
         help="Stock ticker symbol, e.g. AAPL",
     )
     parser.add_argument(
-        "--stop-loss",
-        type=float,
-        metavar="PCT",
-        help="Hard stop loss percentage (5–10 recommended), e.g. --stop-loss 7",
-    )
-    parser.add_argument(
-        "--trail",
-        type=float,
-        metavar="PCT",
-        help="Trailing stop percentage, e.g. --trail 5",
-    )
-    parser.add_argument(
-        "--max-position",
-        type=float,
-        metavar="PCT",
-        help="Max position size as %% of account equity, e.g. --max-position 2",
-    )
-    parser.add_argument(
         "--skip-filters",
         action="store_true",
         help="Bypass premarket filter checks for manually selected tickers",
@@ -428,12 +525,9 @@ def main() -> None:
         sys.exit(1)
 
     # Apply CLI overrides
-    if args.stop_loss:
-        config.risk.stop_loss_pct = args.stop_loss / 100
-    if args.trail:
-        config.risk.trailing_stop_pct = args.trail / 100
-    if args.max_position:
-        config.risk.max_position_pct = args.max_position / 100
+
+
+
 
     try:
         symbol = validate_ticker(args.ticker)

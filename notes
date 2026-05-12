@@ -1,3 +1,4 @@
+# How to run program
 To run Program:
 python run_bot.py YOURTICKER
 
@@ -6,3 +7,19 @@ python run_bot.py YOURTICKER --skip-filters
 
 Skip the filter & momentum confirmation:
 python run_bot.py YOURTICKER --skip-filters --skip-entry-signal
+
+
+
+
+# Notes for building
+- See if there is a way to add limit buy and sell with offset of either 0.10 or 0.05
+
+- Examine near whole or half dollar trailing stops (maybe need to give more leway when appoaraching)
+
+
+- Better the filters, link with newsfeed so it auto fills stocks instead of manual entry, more technical indicators, more market data
+
+
+- MACD, ema 9 20 60, VWAP
+
+- Use logs for analytics

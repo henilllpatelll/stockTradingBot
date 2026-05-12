@@ -16,6 +16,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
     GetOrdersRequest,
+    LimitOrderRequest,
     MarketOrderRequest,
 )
 
@@ -56,7 +57,7 @@ class AlpacaClient:
     # ------------------------------------------------------------------ #
 
     def get_latest_quote(self, symbol: str) -> dict:
-        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed="iex")
         quotes = self._data.get_stock_latest_quote(req)
         q = quotes[symbol]
         ask = float(q.ask_price)
@@ -64,7 +65,7 @@ class AlpacaClient:
         return {"ask": ask, "bid": bid, "mid": (ask + bid) / 2}
 
     def get_snapshot(self, symbol: str):
-        req = StockSnapshotRequest(symbol_or_symbols=symbol)
+        req = StockSnapshotRequest(symbol_or_symbols=symbol, feed="iex")
         snapshots = self._data.get_stock_snapshot(req)
         return snapshots.get(symbol)
 
@@ -77,6 +78,7 @@ class AlpacaClient:
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
+            feed="iex",
         )
         bars = self._data.get_stock_bars(req)
         return self._to_df(bars, symbol).tail(days)
@@ -95,6 +97,7 @@ class AlpacaClient:
             timeframe=timeframe,
             start=start,
             end=end,
+            feed="iex",
         )
         bars = self._data.get_stock_bars(req)
         return self._to_df(bars, symbol)
@@ -131,6 +134,38 @@ class AlpacaClient:
             order.id,
         )
         return order
+
+    def place_limit_order(self, symbol: str, qty: int, side: OrderSide, limit_price: float):
+        req = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(limit_price, 2),
+        )
+        order = self._trading.submit_order(req)
+        logger.info(
+            "Limit order submitted: %s %d %s @ $%.2f — id=%s",
+            side.value,
+            qty,
+            symbol,
+            limit_price,
+            order.id,
+        )
+        return order
+
+    def get_order(self, order_id: str) -> Optional[object]:
+        try:
+            return self._trading.get_order_by_id(order_id)
+        except Exception:
+            return None
+
+    def cancel_order(self, order_id: str) -> None:
+        try:
+            self._trading.cancel_order_by_id(order_id)
+            logger.info("Order cancelled: %s", order_id)
+        except Exception as exc:
+            logger.warning("Could not cancel order %s: %s", order_id, exc)
 
     def get_position(self, symbol: str) -> Optional[object]:
         try:
