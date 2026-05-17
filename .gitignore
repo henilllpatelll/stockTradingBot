@@ -1,0 +1,27 @@
+# Environment & secrets
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs (runtime artifacts)
+logs/*.log
+logs/*.csv
+
+# Local IDE / Claude settings
+.claude/
+
+# Notes (local scratch)
+notes
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node / frontend build
+frontend/node_modules/
+frontend/dist/
