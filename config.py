@@ -39,10 +39,10 @@ class FilterConfig:
 
 @dataclass
 class ScannerConfig:
-    scan_start_hour_et: int = 4
-    scan_end_hour_et: int = 9
-    scan_end_minute_et: int = 30
-    alert_hours_et: list = field(default_factory=lambda: [7, 8, 9])
+    scan_start_hour_et: int = 4   # 4:00 AM ET — premarket open
+    scan_end_hour_et: int = 20    # 8:00 PM ET — after-hours close
+    scan_end_minute_et: int = 0
+    alert_hours_et: list = field(default_factory=lambda: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
     refresh_interval_seconds: int = 30
     news_lookback_hours: int = 12
 
@@ -74,8 +74,8 @@ class Config:
     # Force-close position after this many minutes regardless of P&L
     max_hold_minutes: int = 120
     # Trading session window (ET hours) used by is_trading_hours()
-    trading_start_hour_et: int = 7
-    trading_end_hour_et: int = 11
+    trading_start_hour_et: int = 4   # 4:00 AM ET — premarket
+    trading_end_hour_et: int = 20    # 8:00 PM ET — after-hours close
 
     def __post_init__(self) -> None:
         if not self.paper_only:
