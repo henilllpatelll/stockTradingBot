@@ -51,9 +51,23 @@ def setup_logging(log_dir: str) -> None:
     )
 
 
+def _impact(rvol: float) -> str:
+    if rvol >= 10:
+        return "High"
+    if rvol >= 5:
+        return "Medium"
+    return "Low"
+
+
 class NewsStreamBot:
-    def __init__(self, config: Config, auto_trade: bool = False) -> None:
+    def __init__(
+        self,
+        config: Config,
+        on_alert=None,
+        auto_trade: bool = False,
+    ) -> None:
         self._cfg = config
+        self._on_alert = on_alert  # async callback(alert: dict) — set by api.py
         self._auto_trade = auto_trade
         self._client = AlpacaClient(config)
         self._scanner = PremarketScanner(config, self._client)
@@ -124,19 +138,40 @@ class NewsStreamBot:
                 continue
 
             self._alerted.add(symbol)
-            print(
-                f"\n{'═' * 58}\n"
-                f"  *** LIVE NEWS ALERT  [{_et_now()}] ***\n"
-                f"{'═' * 58}\n"
-                f"  Symbol  : {symbol}\n"
-                f"  Headline: {headline}\n"
-                f"  Source  : {source}\n"
-                f"  Price   : ${candidate.price:.2f}\n"
-                f"  Gap     : +{candidate.gap_pct:.1f}%\n"
-                f"  RVOL    : {candidate.rvol:.1f}x\n"
-                f"  Float   : {candidate.float_shares / 1e6:.1f}M\n"
-                f"{'═' * 58}\n"
+
+            alert = {
+                "id": f"{symbol}_{int(time.time())}",
+                "time": _et_now(),
+                "symbol": symbol,
+                "headline": headline,
+                "source": source,
+                "price": candidate.price,
+                "gap_pct": candidate.gap_pct,
+                "rvol": candidate.rvol,
+                "float_shares": candidate.float_shares,
+                "impact": _impact(candidate.rvol),
+            }
+
+            logger.info(
+                "ALERT %s +%.1f%% RVOL %.1fx | %s", symbol, candidate.gap_pct, candidate.rvol, headline
             )
+
+            if self._on_alert is not None:
+                await self._on_alert(alert)
+            else:
+                print(
+                    f"\n{'═' * 58}\n"
+                    f"  *** LIVE NEWS ALERT  [{_et_now()}] ***\n"
+                    f"{'═' * 58}\n"
+                    f"  Symbol  : {symbol}\n"
+                    f"  Headline: {headline}\n"
+                    f"  Source  : {source}\n"
+                    f"  Price   : ${candidate.price:.2f}\n"
+                    f"  Gap     : +{candidate.gap_pct:.1f}%\n"
+                    f"  RVOL    : {candidate.rvol:.1f}x\n"
+                    f"  Float   : {candidate.float_shares / 1e6:.1f}M\n"
+                    f"{'═' * 58}\n"
+                )
 
             if self._auto_trade:
                 asyncio.create_task(self._execute_trade(symbol, headline, candidate))
