@@ -25,7 +25,7 @@ class AlpacaConfig:
 @dataclass
 class FilterConfig:
     # Price range for eligible tickers
-    min_price: float = 2.0
+    min_price: float = 1.0
     max_price: float = 20.0
     # Maximum float (shares available to trade)
     max_float_shares: float = 20_000_000
@@ -34,7 +34,17 @@ class FilterConfig:
     # Minimum % change from the previous session's close
     min_change_pct: float = 5.0
     # Minimum relative volume (1.0 = average)
-    min_rvol: float = 1.0
+    min_rvol: float = 5.0
+
+
+@dataclass
+class ScannerConfig:
+    scan_start_hour_et: int = 4
+    scan_end_hour_et: int = 9
+    scan_end_minute_et: int = 30
+    alert_hours_et: list = field(default_factory=lambda: [7, 8, 9])
+    refresh_interval_seconds: int = 30
+    news_lookback_hours: int = 12
 
 
 @dataclass
@@ -54,6 +64,7 @@ class Config:
     alpaca: AlpacaConfig = field(default_factory=AlpacaConfig)
     filters: FilterConfig = field(default_factory=FilterConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    scanner: ScannerConfig = field(default_factory=ScannerConfig)
 
     log_dir: str = "logs"
     # Safety guard — changing this to False raises immediately.
@@ -62,6 +73,9 @@ class Config:
     monitor_interval_seconds: int = 1.0
     # Force-close position after this many minutes regardless of P&L
     max_hold_minutes: int = 120
+    # Trading session window (ET hours) used by is_trading_hours()
+    trading_start_hour_et: int = 7
+    trading_end_hour_et: int = 11
 
     def __post_init__(self) -> None:
         if not self.paper_only:

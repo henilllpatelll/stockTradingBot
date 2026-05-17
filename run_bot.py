@@ -171,11 +171,17 @@ def monitor_position(
                             prev_candle_low = float(bars["low"].iloc[-1])
                             candidate = round(prev_candle_low - atr * config.risk.atr_multiplier, 4)
                             if candidate > current_stop:
-                                log.info(
-                                    "%s: stop raised  candle_low=$%.2f  atr=$%.4f  new_stop=$%.2f -> $%.2f",
-                                    symbol, prev_candle_low, atr, current_stop, candidate,
-                                )
-                                current_stop = candidate
+                                if candidate >= current_price:
+                                    log.warning(
+                                        "%s: stop candidate=$%.2f >= price=$%.2f — keeping stop at $%.2f",
+                                        symbol, candidate, current_price, current_stop,
+                                    )
+                                else:
+                                    log.info(
+                                        "%s: stop raised  candle_low=$%.2f  atr=$%.4f  new_stop=$%.2f -> $%.2f",
+                                        symbol, prev_candle_low, atr, current_stop, candidate,
+                                    )
+                                    current_stop = candidate
 
                     # T3: sell remaining if a candle closes below the 9-EMA
                     if t1_hit and t2_hit and len(bars) >= 9:

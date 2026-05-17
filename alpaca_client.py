@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
+import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import (
     StockBarsRequest,
@@ -24,6 +25,8 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+_NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
+
 
 class AlpacaClient:
     """Thin wrapper around the Alpaca paper-trading and data APIs."""
@@ -32,15 +35,21 @@ class AlpacaClient:
         if not config.paper_only:
             raise ValueError("Only paper trading is supported.")
         config.alpaca.validate()
+        self._api_key = config.alpaca.api_key
+        self._secret_key = config.alpaca.secret_key
         self._trading = TradingClient(
-            api_key=config.alpaca.api_key,
-            secret_key=config.alpaca.secret_key,
+            api_key=self._api_key,
+            secret_key=self._secret_key,
             paper=True,
         )
         self._data = StockHistoricalDataClient(
-            api_key=config.alpaca.api_key,
-            secret_key=config.alpaca.secret_key,
+            api_key=self._api_key,
+            secret_key=self._secret_key,
         )
+        self._news_headers = {
+            "APCA-API-KEY-ID": self._api_key,
+            "APCA-API-SECRET-KEY": self._secret_key,
+        }
 
     # ------------------------------------------------------------------ #
     # Account                                                              #
@@ -57,7 +66,7 @@ class AlpacaClient:
     # ------------------------------------------------------------------ #
 
     def get_latest_quote(self, symbol: str) -> dict:
-        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed="iex")
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed="sip")
         quotes = self._data.get_stock_latest_quote(req)
         q = quotes[symbol]
         ask = float(q.ask_price)
@@ -65,7 +74,7 @@ class AlpacaClient:
         return {"ask": ask, "bid": bid, "mid": (ask + bid) / 2}
 
     def get_snapshot(self, symbol: str):
-        req = StockSnapshotRequest(symbol_or_symbols=symbol, feed="iex")
+        req = StockSnapshotRequest(symbol_or_symbols=symbol, feed="sip")
         snapshots = self._data.get_stock_snapshot(req)
         return snapshots.get(symbol)
 
@@ -78,7 +87,7 @@ class AlpacaClient:
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
-            feed="iex",
+            feed="sip",
         )
         bars = self._data.get_stock_bars(req)
         return self._to_df(bars, symbol).tail(days)
@@ -97,10 +106,47 @@ class AlpacaClient:
             timeframe=timeframe,
             start=start,
             end=end,
-            feed="iex",
+            feed="sip",
         )
         bars = self._data.get_stock_bars(req)
         return self._to_df(bars, symbol)
+
+    def get_market_universe(self, max_symbols: int = 100) -> list[str]:
+        """Return a list of active small-cap ticker symbols to scan for premarket gaps.
+        Combines yfinance small_cap_gainers + most_actives screener results."""
+        import yfinance as yf
+        symbols: list[str] = []
+        for screen in ("small_cap_gainers", "most_actives"):
+            try:
+                screener = yf.Screener()
+                screener.set_predefined_body(screen)
+                quotes = screener.response.get("quotes", [])
+                for q in quotes:
+                    sym = q.get("symbol", "")
+                    if sym and sym.isalpha() and sym not in symbols:
+                        symbols.append(sym)
+            except Exception as exc:
+                logger.warning("get_market_universe screen=%s failed: %s", screen, exc)
+        if not symbols:
+            logger.error(
+                "get_market_universe returned no symbols — pass a fixed universe list instead"
+            )
+        return symbols[:max_symbols]
+
+    def get_news(self, symbol: str, lookback_hours: int = 24) -> list[str]:
+        """Return headline strings for *symbol* from the last *lookback_hours* hours.
+        Returns [] on any error — callers should never have to catch."""
+        start = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        resp = requests.get(
+            _NEWS_URL,
+            headers=self._news_headers,
+            params={"symbols": symbol, "start": start, "limit": 10, "sort": "desc"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        return [item["headline"] for item in resp.json().get("news", [])]
 
     @staticmethod
     def _to_df(bars_response, symbol: str) -> pd.DataFrame:
