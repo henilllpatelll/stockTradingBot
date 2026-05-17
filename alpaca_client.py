@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
+import pytz
 import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import (
@@ -72,6 +73,42 @@ class AlpacaClient:
         ask = float(q.ask_price)
         bid = float(q.bid_price)
         return {"ask": ask, "bid": bid, "mid": (ask + bid) / 2}
+
+    def get_quote_with_spread(self, symbol: str) -> dict:
+        q = self.get_latest_quote(symbol)
+        ask, bid, mid = q["ask"], q["bid"], q["mid"]
+        spread_cents = round((ask - bid) * 100, 2)
+        spread_pct = round((ask - bid) / mid * 100, 2) if mid > 0 else 0.0
+        return {
+            "ask": ask,
+            "bid": bid,
+            "mid": mid,
+            "spread_cents": spread_cents,
+            "spread_pct": spread_pct,
+            "wide_spread": spread_pct > 2.0,
+        }
+
+    def get_premarket_bars(self, symbol: str, date: Optional[datetime] = None) -> pd.DataFrame:
+        """Return 1-min bars from 4:00 AM to 9:29 AM ET for the given date (default: today)."""
+        et_tz = pytz.timezone("America/New_York")
+        if date is None:
+            now_et = datetime.now(et_tz)
+        else:
+            now_et = date.astimezone(et_tz) if date.tzinfo else et_tz.localize(date)
+        trading_date = now_et.date()
+        start_et = et_tz.localize(datetime(trading_date.year, trading_date.month, trading_date.day, 4, 0, 0))
+        end_et = et_tz.localize(datetime(trading_date.year, trading_date.month, trading_date.day, 9, 29, 59))
+        start_utc = start_et.astimezone(timezone.utc)
+        end_utc = end_et.astimezone(timezone.utc)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=start_utc,
+            end=end_utc,
+            feed="sip",
+        )
+        bars = self._data.get_stock_bars(req)
+        return self._to_df(bars, symbol)
 
     def get_snapshot(self, symbol: str):
         req = StockSnapshotRequest(symbol_or_symbols=symbol, feed="sip")
@@ -163,6 +200,14 @@ class AlpacaClient:
     # ------------------------------------------------------------------ #
     # Order management                                                     #
     # ------------------------------------------------------------------ #
+
+    def place_entry_limit_order(self, symbol: str, qty: int, ask: float):
+        """Buy limit at ask + $0.02 — tighter slippage than the old ask + $0.05."""
+        return self.place_limit_order(symbol, qty, OrderSide.BUY, round(ask + 0.02, 2))
+
+    def place_exit_limit_order(self, symbol: str, qty: int, bid: float):
+        """Sell limit at bid — no haircut on exits."""
+        return self.place_limit_order(symbol, qty, OrderSide.SELL, round(bid, 2))
 
     def place_market_order(self, symbol: str, qty: int, side: OrderSide):
         req = MarketOrderRequest(

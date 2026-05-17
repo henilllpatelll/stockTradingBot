@@ -22,6 +22,8 @@ _FIELDS = [
     "pnl_pct",
     "rvol",
     "change_pct",
+    "setup_name",
+    "catalyst_headline",
 ]
 
 
@@ -40,6 +42,8 @@ class TradeRecord:
     exit_reason: Optional[str] = None
     pnl: Optional[float] = None
     pnl_pct: Optional[float] = None
+    setup_name: str = ""
+    catalyst_headline: str = ""
 
 
 class TradeLogger:
@@ -67,7 +71,7 @@ class TradeLogger:
     def log_exit(self, trade: TradeRecord) -> None:
         rows = []
         with open(self._csv, newline="") as fh:
-            rows = list(csv.DictReader(fh))
+            rows = list(csv.DictReader(fh, restval=""))
 
         # Update the most-recent open record for this symbol
         for row in reversed(rows):

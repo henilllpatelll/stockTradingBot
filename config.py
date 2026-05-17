@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Dict
 
 from dotenv import load_dotenv
 
@@ -49,14 +50,46 @@ class ScannerConfig:
 
 @dataclass
 class RiskConfig:
-    # Fixed dollar amount to spend per trade
     position_size_dollars: float = 500.0
-    # Fixed dollar offset below avg fill price for the initial stop
     initial_stop_offset: float = 0.10
-    # ATR multiplier for the post-T1 trailing stop buffer (0.5 to 1.0)
     atr_multiplier: float = 0.5
-    # Daily loss ceiling — no new trades once hit
     max_daily_loss_pct: float = 0.10
+    # Minimum reward/risk ratio — T1 target = entry + min_rr_ratio × risk
+    min_rr_ratio: float = 2.0
+    # Candle range > atr × this = climax/extension bar → exit signal
+    extension_bar_atr_mult: float = 2.0
+    # Bail if price makes < stall_progress_threshold progress toward T1 after N bars
+    stall_bars: int = 3
+    stall_progress_threshold: float = 0.10
+    # Bail if volume drops below this fraction of entry-bar volume for N consecutive bars
+    momentum_fail_vol_ratio: float = 0.50
+    momentum_fail_bars: int = 2
+    # Seconds to wait for limit entry fill before cancelling
+    entry_fill_timeout_seconds: int = 15
+
+
+@dataclass
+class NewsEvaluatorConfig:
+    enabled: bool = True
+    model: str = "claude-sonnet-4-6"
+    confidence_threshold: float = 0.60
+    # Per-setup confidence overrides (higher = stricter for riskier patterns)
+    setup_confidence_overrides: Dict[str, float] = field(default_factory=lambda: {
+        "premarket_high_break": 0.65,
+        "pm_flag_break": 0.60,
+        "pm_pivot_break": 0.60,
+        "red_to_green": 0.60,
+        "1min_orb": 0.65,
+        "5min_orb": 0.62,
+        "first_pullback_bull_flag": 0.58,
+        "flat_top_breakout": 0.70,
+    })
+    # "hot" = more permissive, "cold" = more selective
+    market_regime: str = "hot"
+    # False = autonomous (API errors → skip trade, never prompt user)
+    fallback_to_manual: bool = False
+    timeout_seconds: float = 15.0
+    max_tokens: int = 512
 
 
 @dataclass
@@ -65,17 +98,15 @@ class Config:
     filters: FilterConfig = field(default_factory=FilterConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     scanner: ScannerConfig = field(default_factory=ScannerConfig)
+    news_evaluator: NewsEvaluatorConfig = field(default_factory=NewsEvaluatorConfig)
 
     log_dir: str = "logs"
-    # Safety guard — changing this to False raises immediately.
     paper_only: bool = True
-    # Seconds between position-monitoring polls
-    monitor_interval_seconds: int = 1.0
-    # Force-close position after this many minutes regardless of P&L
+    monitor_interval_seconds: int = 1
     max_hold_minutes: int = 120
-    # Trading session window (ET hours) used by is_trading_hours()
-    trading_start_hour_et: int = 4   # 4:00 AM ET — premarket
-    trading_end_hour_et: int = 20    # 8:00 PM ET — after-hours close
+    # Active execution window — scanner still runs 4-20 ET but trades only fire here
+    trading_start_hour_et: int = 7   # 7:00 AM ET
+    trading_end_hour_et: int = 11    # 11:00 AM ET
 
     def __post_init__(self) -> None:
         if not self.paper_only:
