@@ -1,12 +1,9 @@
 # How to run program
-To run Program:
-python run_bot.py YOURTICKER
+python scripts/_smoke_test.py     # verify API keys, imports, account connection
 
-Skip filters confirmation:
-python run_bot.py YOURTICKER --skip-filters
-
-Skip the filter & momentum confirmation:
-python run_bot.py YOURTICKER --skip-filters --skip-entry-signal
+python api.py                     # backend REST API on port 8000
+cd frontend && npm run dev        # dashboard UI
+python run_bot.py                 # main trading loop (paper trading)
 
 
 
@@ -23,3 +20,21 @@ python run_bot.py YOURTICKER --skip-filters --skip-entry-signal
 - MACD, ema 9 20 60, VWAP
 
 - Use logs for analytics
+
+
+- better the take profit
+
+
+- change limit ask to +0.10
+- time 7-11
+- implement the agent learning over trades to get better so it can get a higher percentage win rate over time
+
+
+no hard settings have the b9t fully autnomous trading on the fly
+
+
+Strategy B: technical_filters is essentially dead config right now. If you want both running simultaneously, you'd need to either run two separate bot processes (one per strategy) or wire technical_filters
+  into a second scan loop in run_bot.py. Want to do that?
+
+
+  improve entry strategy

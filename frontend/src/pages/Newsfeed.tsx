@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Rss, AlertCircle, Clock, Wifi, WifiOff } from 'lucide-react';
+import { Rss, AlertCircle, Clock, Wifi, WifiOff, Zap } from 'lucide-react';
 import '../App.css';
 
 interface NewsAlert {
@@ -18,30 +18,61 @@ export default function Newsfeed() {
   const [alerts, setAlerts] = useState<NewsAlert[]>([]);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [trading, setTrading] = useState<string | null>(null);
+  const [tradeMsg, setTradeMsg] = useState<{ id: string; msg: string; ok: boolean } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const connect = () => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-    const ws = new WebSocket('ws://127.0.0.1:8000/ws/news');
-    wsRef.current = ws;
-    ws.onopen = () => { setConnected(true); setError(null); };
-    ws.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      if (data.type === 'history') {
-        setAlerts(data.alerts);
-      } else if (data.type === 'alert') {
-        const { type: _, ...alert } = data;
-        setAlerts(prev => [alert, ...prev].slice(0, 100));
-      }
-    };
-    ws.onclose = () => { setConnected(false); reconnectRef.current = setTimeout(connect, 3000); };
-    ws.onerror = () => { setError('Cannot connect — make sure python api.py is running'); setConnected(false); };
+  const tradeTicker = async (alert: NewsAlert) => {
+    setTrading(alert.id);
+    setTradeMsg(null);
+    try {
+      const res = await fetch('http://127.0.0.1:8001/api/trade', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: alert.symbol,
+          skip_filters: true,
+          headline: alert.headline,
+          strategy: 'catalyst',
+        }),
+      });
+      const json = await res.json();
+      setTradeMsg({ id: alert.id, msg: json.message, ok: json.status === 'ok' });
+    } catch {
+      setTradeMsg({ id: alert.id, msg: 'API unreachable', ok: false });
+    } finally {
+      setTrading(null);
+      setTimeout(() => setTradeMsg(null), 4000);
+    }
   };
 
   useEffect(() => {
+    const connect = () => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) return;
+      const ws = new WebSocket('ws://127.0.0.1:8001/ws/news');
+      wsRef.current = ws;
+      ws.onopen = () => { setConnected(true); setError(null); };
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.type === 'history') {
+          setAlerts(data.alerts);
+        } else if (data.type === 'alert') {
+          const alert = Object.fromEntries(
+            Object.entries(data).filter(([key]) => key !== 'type'),
+          ) as unknown as NewsAlert;
+          setAlerts(prev => [alert, ...prev].slice(0, 100));
+        }
+      };
+      ws.onclose = () => { setConnected(false); reconnectRef.current = setTimeout(connect, 3000); };
+      ws.onerror = () => { setError('Cannot connect - make sure python api.py is running'); setConnected(false); };
+    };
+
     connect();
-    return () => { reconnectRef.current && clearTimeout(reconnectRef.current); wsRef.current?.close(); };
+    return () => {
+      if (reconnectRef.current) clearTimeout(reconnectRef.current);
+      wsRef.current?.close();
+    };
   }, []);
 
   const getImpactColor = (impact: string) => {
@@ -55,9 +86,9 @@ export default function Newsfeed() {
       <div className="header" style={{ marginBottom: '1.5rem', paddingBottom: '1rem' }}>
         <div className="header-title">
           <h2 style={{ fontSize: '1.5rem', fontWeight: 700, color: '#fff', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <Rss className="text-accent-primary" /> Live Newsfeed
+            <Rss className="text-accent-primary" /> Trade News Catalysts
           </h2>
-          <p style={{ color: 'var(--text-muted)' }}>Alpaca WebSocket — alerts fire the moment a headline arrives</p>
+          <p style={{ color: 'var(--text-muted)' }}>Alpaca WebSocket + GlobeNewswire RSS — alerts fire the moment a headline arrives</p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: connected ? 'var(--accent-primary)' : 'var(--accent-danger)' }}>
           {connected ? <Wifi size={16} /> : <WifiOff size={16} />}
@@ -98,11 +129,30 @@ export default function Newsfeed() {
                 {alert.rvol > 0 && <span style={{ color: 'var(--text-secondary)' }}>{alert.rvol?.toFixed(1)}x RVOL</span>}
                 <span style={{ color: getImpactColor(alert.impact), fontWeight: 600 }}>{alert.impact}</span>
               </div>
+              {tradeMsg?.id === alert.id && (
+                <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: tradeMsg.ok ? '#4ade80' : '#f87171' }}>
+                  {tradeMsg.msg}
+                </div>
+              )}
             </div>
+            <button
+              className="news-trade-btn"
+              onClick={() => tradeTicker(alert)}
+              disabled={trading === alert.id}
+            >
+              <Zap size={14} fill="currentColor" />
+              {trading === alert.id ? '...' : 'Trade'}
+            </button>
           </div>
         ))}
       </div>
-      <style>{`.news-card { transition: transform 0.2s; } .news-card:hover { transform: translateX(5px); border-left: 4px solid var(--accent-primary); }`}</style>
+      <style>{`
+        .news-card { transition: transform 0.2s; }
+        .news-card:hover { transform: translateX(5px); border-left: 4px solid var(--accent-primary); }
+        .news-trade-btn { flex-shrink: 0; display: flex; align-items: center; gap: 0.35rem; padding: 0.5rem 0.85rem; border-radius: var(--radius-md); background: rgba(74,222,128,0.12); color: #4ade80; font-weight: 700; font-size: 0.8rem; border: 1px solid rgba(74,222,128,0.25); cursor: pointer; transition: all 0.2s; white-space: nowrap; }
+        .news-trade-btn:hover:not(:disabled) { background: rgba(74,222,128,0.22); box-shadow: 0 0 10px rgba(74,222,128,0.25); }
+        .news-trade-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+      `}</style>
     </div>
   );
 }

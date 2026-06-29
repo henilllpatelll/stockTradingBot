@@ -149,25 +149,28 @@ class AlpacaClient:
         return self._to_df(bars, symbol)
 
     def get_market_universe(self, max_symbols: int = 100) -> list[str]:
-        """Return a list of active small-cap ticker symbols to scan for premarket gaps.
-        Combines yfinance small_cap_gainers + most_actives screener results."""
-        import yfinance as yf
+        """Return active small-cap ticker symbols using Alpaca's screener API."""
         symbols: list[str] = []
-        for screen in ("small_cap_gainers", "most_actives"):
+        headers = {
+            "APCA-API-KEY-ID": self._api_key,
+            "APCA-API-SECRET-KEY": self._secret_key,
+        }
+        screens = [
+            ("https://data.alpaca.markets/v1beta1/screener/stocks/most-actives?by=volume&top=50", "most_actives"),
+            ("https://data.alpaca.markets/v1beta1/screener/stocks/movers?top=50", "gainers"),
+        ]
+        for url, key in screens:
             try:
-                screener = yf.Screener()
-                screener.set_predefined_body(screen)
-                quotes = screener.response.get("quotes", [])
-                for q in quotes:
-                    sym = q.get("symbol", "")
+                resp = requests.get(url, headers=headers, timeout=10)
+                resp.raise_for_status()
+                for entry in resp.json().get(key, []):
+                    sym = entry.get("symbol", "")
                     if sym and sym.isalpha() and sym not in symbols:
                         symbols.append(sym)
             except Exception as exc:
-                logger.warning("get_market_universe screen=%s failed: %s", screen, exc)
+                logger.warning("get_market_universe screen=%s failed: %s", key, exc)
         if not symbols:
-            logger.error(
-                "get_market_universe returned no symbols — pass a fixed universe list instead"
-            )
+            logger.error("get_market_universe returned no symbols")
         return symbols[:max_symbols]
 
     def get_news(self, symbol: str, lookback_hours: int = 24) -> list[str]:
@@ -176,14 +179,17 @@ class AlpacaClient:
         start = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
-        resp = requests.get(
-            _NEWS_URL,
-            headers=self._news_headers,
-            params={"symbols": symbol, "start": start, "limit": 10, "sort": "desc"},
-            timeout=5,
-        )
-        resp.raise_for_status()
-        return [item["headline"] for item in resp.json().get("news", [])]
+        try:
+            resp = requests.get(
+                _NEWS_URL,
+                headers=self._news_headers,
+                params={"symbols": symbol, "start": start, "limit": 10, "sort": "desc"},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            return [item["headline"] for item in resp.json().get("news", [])]
+        except Exception:
+            return []
 
     @staticmethod
     def _to_df(bars_response, symbol: str) -> pd.DataFrame:
@@ -202,12 +208,12 @@ class AlpacaClient:
     # ------------------------------------------------------------------ #
 
     def place_entry_limit_order(self, symbol: str, qty: int, ask: float):
-        """Buy limit at ask + $0.02 — tighter slippage than the old ask + $0.05."""
-        return self.place_limit_order(symbol, qty, OrderSide.BUY, round(ask + 0.02, 2))
+        """Buy limit at ask + $0.10."""
+        return self.place_limit_order(symbol, qty, OrderSide.BUY, round(ask + 0.10, 2))
 
     def place_exit_limit_order(self, symbol: str, qty: int, bid: float):
-        """Sell limit at bid — no haircut on exits."""
-        return self.place_limit_order(symbol, qty, OrderSide.SELL, round(bid, 2))
+        """Sell limit at bid - $0.10."""
+        return self.place_limit_order(symbol, qty, OrderSide.SELL, round(bid - 0.10, 2))
 
     def place_market_order(self, symbol: str, qty: int, side: OrderSide):
         req = MarketOrderRequest(

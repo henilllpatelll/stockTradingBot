@@ -20,7 +20,7 @@ STRATEGY RULES (all must apply for a trade):
 2. Already up ≥ 10% on the day — momentum is real
 3. Clear catalyst: earnings beat, FDA approval, major contract, buyout rumor, short squeeze catalyst, PR from credible source
 4. Price $1–$20 — sweet spot for volatility and crowd participation
-5. Low float < 20M shares — limited supply creates explosive moves
+5. Low float < 10M shares — limited supply creates explosive moves
 
 CATALYST QUALITY RUBRIC:
 - strong (confidence 0.80–1.00): earnings beat, FDA approval, merger/acquisition, major contract, biotech catalyst — news that creates sustained crowd participation
@@ -133,16 +133,27 @@ class TradingAI:
         filter_data: dict,
         setup_name: str = "",
         pattern_ctx: Optional[PatternContext] = None,
+        perf_stats: Optional[dict] = None,
     ) -> TradeDecision:
         if not headlines and not setup_name:
             return TradeDecision.reject("no_catalyst")
 
-        # Effective threshold based on setup type and market regime
+        # Base threshold from config
         threshold = self._cfg.setup_confidence_overrides.get(setup_name, self._cfg.confidence_threshold)
         if self._cfg.market_regime == "cold":
             threshold = min(threshold + 0.10, 0.95)
 
-        user_msg = self._build_user_message(symbol, headlines, filter_data, setup_name, pattern_ctx)
+        # Learning adjustment: raise/lower threshold based on this setup's live win rate
+        if perf_stats:
+            s = perf_stats.get("by_setup", {}).get(setup_name, {})
+            if s.get("trades", 0) >= 5:
+                wr = s["win_rate"]
+                if wr >= 0.65:
+                    threshold = max(threshold - 0.07, 0.40)
+                elif wr < 0.45:
+                    threshold = min(threshold + 0.07, 0.92)
+
+        user_msg = self._build_user_message(symbol, headlines, filter_data, setup_name, pattern_ctx, perf_stats)
 
         t0 = time.monotonic()
         try:
@@ -200,6 +211,7 @@ class TradingAI:
         filter_data: dict,
         setup_name: str,
         pattern_ctx: Optional[PatternContext],
+        perf_stats: Optional[dict] = None,
     ) -> str:
         headline_block = "\n".join(f"  - {h}" for h in headlines[:5]) if headlines else "  (none)"
         pattern_block = ""
@@ -219,6 +231,32 @@ class TradingAI:
             if self._cfg.market_regime == "hot"
             else "Market is COLD — be highly selective, A+ setups only."
         )
+
+        perf_block = ""
+        if perf_stats and perf_stats.get("overall", {}).get("trades", 0) >= 3:
+            ov = perf_stats["overall"]
+            perf_block = (
+                f"\nBot Live Track Record ({ov['trades']} closed trades | "
+                f"{ov['win_rate']:.0%} win rate | avg P&L ${ov['avg_pnl']:+.2f}):\n"
+            )
+            setup_s = perf_stats.get("by_setup", {}).get(setup_name)
+            if setup_s and setup_s["trades"] >= 3:
+                perf_block += (
+                    f"  This setup ({setup_name}): "
+                    f"{setup_s['win_rate']:.0%} wins / {setup_s['trades']} trades | "
+                    f"avg P&L ${setup_s['avg_pnl']:+.2f}\n"
+                )
+            by_cat = perf_stats.get("by_catalyst", {})
+            if by_cat:
+                sorted_cats = sorted(by_cat.items(), key=lambda x: x[1]["win_rate"], reverse=True)
+                best = sorted_cats[0]
+                worst = sorted_cats[-1]
+                if best[0] != worst[0]:
+                    perf_block += (
+                        f"  Best catalyst: {best[0]} {best[1]['win_rate']:.0%} ({best[1]['trades']} trades)\n"
+                        f"  Worst catalyst: {worst[0]} {worst[1]['win_rate']:.0%} ({worst[1]['trades']} trades)\n"
+                    )
+
         return (
             f"Symbol: {symbol}\n"
             f"Price: ${filter_data.get('price', 0):.2f}  "
@@ -229,5 +267,6 @@ class TradingAI:
             f"{pattern_block}"
             f"\nNews headlines:\n{headline_block}\n"
             f"\nMarket regime: {market_regime_note}\n"
+            f"{perf_block}"
             f"\nAssess this setup and return your trade_assessment."
         )

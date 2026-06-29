@@ -198,7 +198,7 @@ class PremarketScanner:
 
         try:
             snapshot = self._client.get_snapshot(symbol)
-            prev_close = float(snapshot.prev_daily_bar.close) if snapshot and snapshot.prev_daily_bar else 0.0
+            prev_close = float(snapshot.previous_daily_bar.close) if snapshot and snapshot.previous_daily_bar else 0.0
             premarket_price = float(snapshot.latest_trade.price) if snapshot and snapshot.latest_trade else 0.0
             premarket_vol = float(snapshot.daily_bar.volume) if snapshot and snapshot.daily_bar else 0.0
         except Exception as exc:
@@ -214,8 +214,8 @@ class PremarketScanner:
             "premarket_volume": premarket_vol,
         }
 
-    def _check_symbol(self, symbol: str) -> "GapperCandidate | None":
-        filters = self._config.filters
+    def _check_symbol(self, symbol: str, filters=None) -> "GapperCandidate | None":
+        filters = filters or self._config.filters
         try:
             data = self._get_fundamentals(symbol)
 
@@ -287,11 +287,132 @@ class PremarketScanner:
             logger.warning("%s: scan error: %s", symbol, exc)
             return None
 
-    def scan_once(self, universe: list) -> list:
+    def _check_symbol_with_detail(self, symbol: str, filters=None) -> tuple:
+        """
+        Like _check_symbol but distinguishes *why* it failed.
+        Returns (GapperCandidate | None, only_momentum_failed: bool).
+        only_momentum_failed=True means price/float/market_cap all passed
+        but gap% and/or RVOL did not — worth putting on a pending watchlist.
+        """
+        filters = filters or self._config.filters
+        try:
+            data = self._get_fundamentals(symbol)
+            price = data["premarket_price"]
+            prev_close = data["prev_close"]
+
+            if not price or not prev_close or prev_close <= 0:
+                logger.debug("%s: no price data from Alpaca snapshot", symbol)
+                return None, False
+
+            gap_pct = (price - prev_close) / prev_close * 100
+
+            if not (filters.min_price <= price <= filters.max_price):
+                logger.info(
+                    "%s: price $%.2f outside $%.2f-$%.2f range",
+                    symbol, price, filters.min_price, filters.max_price,
+                )
+                return None, False
+
+            float_shares = data["float_shares"]
+            market_cap = data["market_cap"]
+            avg_volume = data["avg_volume"]
+
+            if float_shares <= 0 or float_shares >= filters.max_float_shares:
+                logger.info(
+                    "%s: float %.1fM >= %.1fM limit",
+                    symbol, float_shares / 1e6, filters.max_float_shares / 1e6,
+                )
+                return None, False
+
+            if market_cap > 0 and market_cap > filters.max_market_cap:
+                logger.info(
+                    "%s: market cap $%.0fM >= $%.0fM limit",
+                    symbol, market_cap / 1e6, filters.max_market_cap / 1e6,
+                )
+                return None, False
+
+            # Static filters passed — now check momentum-only filters
+            premarket_vol = data["premarket_volume"]
+            rvol = (premarket_vol / avg_volume) if avg_volume > 0 else 0.0
+            rvol_fail = premarket_vol > 0 and rvol < filters.min_rvol
+            gap_fail = gap_pct < filters.min_change_pct
+
+            if rvol_fail or gap_fail:
+                if rvol_fail:
+                    logger.info(
+                        "%s: pending — RVOL %.2fx < %.1fx minimum", symbol, rvol, filters.min_rvol
+                    )
+                if gap_fail:
+                    logger.info(
+                        "%s: pending — gap %.2f%% < %.1f%% minimum", symbol, gap_pct, filters.min_change_pct
+                    )
+                return None, True
+
+            return GapperCandidate(
+                symbol=symbol,
+                price=price,
+                prev_close=prev_close,
+                gap_pct=round(gap_pct, 2),
+                rvol=round(rvol, 2),
+                float_shares=float_shares,
+                market_cap=market_cap,
+                scan_time=_et_now().strftime("%H:%M:%S ET"),
+            ), False
+
+        except Exception as exc:
+            logger.warning("%s: scan error: %s", symbol, exc)
+            return None, False
+
+    def recheck_momentum(self, symbol: str, filters=None) -> "GapperCandidate | None":
+        """
+        Recheck gap% and RVOL only for a symbol already confirmed to pass static filters.
+        Returns GapperCandidate if momentum now qualifies, None otherwise.
+        """
+        filters = filters or self._config.filters
+        try:
+            data = self._get_fundamentals(symbol)
+            price = data["premarket_price"]
+            prev_close = data["prev_close"]
+
+            if not price or not prev_close or prev_close <= 0:
+                return None
+
+            gap_pct = (price - prev_close) / prev_close * 100
+            premarket_vol = data["premarket_volume"]
+            avg_volume = data["avg_volume"]
+            rvol = (premarket_vol / avg_volume) if avg_volume > 0 else 0.0
+
+            rvol_ok = premarket_vol <= 0 or rvol >= filters.min_rvol
+            gap_ok = gap_pct >= filters.min_change_pct
+
+            logger.debug(
+                "%s recheck: gap %.1f%%(need %.1f%%) rvol %.1fx(need %.1fx) -> %s",
+                symbol, gap_pct, filters.min_change_pct, rvol, filters.min_rvol,
+                "PASS" if (rvol_ok and gap_ok) else "wait",
+            )
+
+            if not (rvol_ok and gap_ok):
+                return None
+
+            return GapperCandidate(
+                symbol=symbol,
+                price=price,
+                prev_close=prev_close,
+                gap_pct=round(gap_pct, 2),
+                rvol=round(rvol, 2),
+                float_shares=data["float_shares"],
+                market_cap=data["market_cap"],
+                scan_time=_et_now().strftime("%H:%M:%S ET"),
+            )
+        except Exception as exc:
+            logger.warning("%s: recheck error: %s", symbol, exc)
+            return None
+
+    def scan_once(self, universe: list, filters=None) -> list:
         """Check all tickers. Return passing GapperCandidates sorted by RVOL descending."""
         candidates = []
         for symbol in universe:
-            candidate = self._check_symbol(symbol)
+            candidate = self._check_symbol(symbol, filters=filters)
             if candidate is not None:
                 candidates.append(candidate)
         candidates.sort(key=lambda c: c.rvol, reverse=True)
@@ -299,6 +420,23 @@ class PremarketScanner:
             "Scanned %d symbols -> %d passed all filters", len(universe), len(candidates)
         )
         return candidates
+
+    def scan_once_with_detail(self, universe: list, filters=None) -> tuple[list, list]:
+        """Like scan_once but also returns symbols that pass static filters but not yet momentum."""
+        candidates = []
+        pending = []
+        for symbol in universe:
+            candidate, only_momentum_failed = self._check_symbol_with_detail(symbol, filters=filters)
+            if candidate is not None:
+                candidates.append(candidate)
+            elif only_momentum_failed:
+                pending.append(symbol)
+        candidates.sort(key=lambda c: c.rvol, reverse=True)
+        logger.info(
+            "Scanned %d symbols -> %d passed, %d pending momentum",
+            len(universe), len(candidates), len(pending),
+        )
+        return candidates, pending
 
     def print_ranked_candidates(self, candidates: list) -> None:
         """Console table (sorted RVOL desc): RANK SYMBOL PRICE GAP% RVOL FLOAT(M) CATALYST"""
@@ -336,6 +474,7 @@ class PremarketScanner:
         6. On Ctrl-C: print final ranked table and exit gracefully.
         Pass universe=None to auto-discover stocks via the Alpaca screener on every scan.
         Pass a list to scan a fixed set of tickers instead.
+        Loop runs until scan_end_hour_et (default 8 PM ET).
         """
         cfg = self._config
         refresh = cfg.scanner.refresh_interval_seconds
@@ -353,6 +492,7 @@ class PremarketScanner:
         print(f"[{_et_now().strftime('%H:%M:%S ET')}] Premarket scanner started. Mode: {mode_str}.")
 
         active_candidates: dict[str, GapperCandidate] = {}
+        pending_symbols: set[str] = set()
         last_alert_hour = -1
 
         try:
@@ -365,7 +505,28 @@ class PremarketScanner:
                     logger.warning("Empty universe -- retrying in %ds", refresh)
                     time.sleep(refresh)
                     continue
-                candidates = self.scan_once(current_universe)
+                candidates, new_pending = self.scan_once_with_detail(current_universe)
+
+                # Update pending watchlist
+                candidate_symbols = {c.symbol for c in candidates}
+                for sym in new_pending:
+                    if sym not in self._seen_symbols and sym not in candidate_symbols:
+                        if sym not in pending_symbols:
+                            logger.info("%s: pending watchlist — passes static filters, awaiting gap/RVOL", sym)
+                        pending_symbols.add(sym)
+                pending_symbols -= candidate_symbols
+
+                # Recheck pending symbols — promote any that now meet gap/RVOL
+                for sym in list(pending_symbols):
+                    promoted = self.recheck_momentum(sym)
+                    if promoted is not None:
+                        logger.info(
+                            "%s: promoted from pending — gap=%.1f%% rvol=%.1fx",
+                            sym, promoted.gap_pct, promoted.rvol,
+                        )
+                        pending_symbols.discard(sym)
+                        candidates.append(promoted)
+                candidates.sort(key=lambda c: c.rvol, reverse=True)
 
                 no_catalyst = 0
                 for c in candidates:
@@ -399,9 +560,10 @@ class PremarketScanner:
                     logger.info("%s: faded below filters -- removed from watch list", stale)
                     del active_candidates[stale]
 
-                if candidates and no_catalyst:
+                if no_catalyst or pending_symbols:
                     logger.info(
-                        "%d passed filters -- %d skipped (no catalyst)", len(candidates), no_catalyst
+                        "%d passed filters -- %d skipped (no catalyst) -- %d pending momentum",
+                        len(candidates), no_catalyst, len(pending_symbols),
                     )
 
                 in_alert, alert_hour = is_alert_window(cfg)

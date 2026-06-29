@@ -16,19 +16,28 @@ from alpaca_client import AlpacaClient
 from config import Config
 from risk_manager import PositionSizing, RiskManager
 from strategy import (
-    EntrySignal, FilterResult, PatternContext, PremkLevels,
+    EntrySignal, FilterResult, PremkLevels,
     PremarketCatalystStrategy, mark_premarket_levels, run_setup_detectors,
 )
-from trade_logger import TradeLogger, TradeRecord
+from trade_logger import PerformanceTracker, TradeLogger, TradeRecord
 
 _ET = pytz.timezone("America/New_York")
 
 # Duck-type for argparse.Namespace when called programmatically
 _AutoArgs = namedtuple(
     "_AutoArgs",
-    ["no_trading_hours_gate", "no_catalyst_check", "summary", "skip_filters", "skip_entry_signal"],
-    defaults=[False, False, False, False, False],
+    [
+        "no_trading_hours_gate",
+        "no_catalyst_check",
+        "summary",
+        "skip_filters",
+        "skip_entry_signal",
+        "catalyst_headline",
+    ],
+    defaults=[False, False, False, False, False, ""],
 )
+
+_LEARNING_MIN_SAMPLE = 5
 
 
 def setup_logging(log_dir: str) -> None:
@@ -73,11 +82,86 @@ def _is_trading_hours(config: Config) -> bool:
     return config.trading_start_hour_et <= now_et.hour < config.trading_end_hour_et
 
 
+def _rank_setups_by_learning(active_setups: list, perf_stats: dict) -> list:
+    """Prefer confirmed setups with enough history and better live win rates."""
+    if len(active_setups) < 2 or not perf_stats:
+        return active_setups
+
+    by_setup = perf_stats.get("by_setup", {})
+
+    def _rank_key(indexed_setup):
+        idx, setup = indexed_setup
+        setup_name = setup[0]
+        stats = by_setup.get(setup_name, {})
+        trades = int(stats.get("trades", 0) or 0)
+        if trades < _LEARNING_MIN_SAMPLE:
+            return (1, 0.50, 0.0, -idx)
+        win_rate = float(stats.get("win_rate", 0.0) or 0.0)
+        avg_pnl = float(stats.get("avg_pnl", 0.0) or 0.0)
+        if win_rate < 0.45:
+            return (0, win_rate, avg_pnl, -idx)
+        return (
+            2,
+            win_rate,
+            avg_pnl,
+            -idx,
+        )
+
+    ranked = sorted(enumerate(active_setups), key=_rank_key, reverse=True)
+    return [setup for _, setup in ranked]
+
+
+def _clamped_ratio(value: float, full_strength_value: float) -> float:
+    if full_strength_value <= 0:
+        return 0.0
+    return max(0.0, min(value / full_strength_value, 1.0))
+
+
+def _entry_signal_quality(signal: EntrySignal, config: Config) -> float:
+    """
+    Convert the non-AI entry signal into a confidence-like score.
+
+    The score rewards the same things the strategy already filters for: RVOL,
+    gap strength, and accelerating volume.
+    """
+    rvol_score = _clamped_ratio(signal.rvol, config.filters.min_rvol * 2)
+    gap_score = _clamped_ratio(signal.change_pct, config.filters.min_change_pct * 3)
+    volume_score = _clamped_ratio(signal.vol_acceleration, 3.0)
+    return round((0.45 * rvol_score) + (0.25 * gap_score) + (0.30 * volume_score), 4)
+
+
+def _learned_entry_gate(signal: EntrySignal, config: Config, perf_tracker) -> tuple[bool, float, float]:
+    base_threshold = config.news_evaluator.setup_confidence_overrides.get(
+        signal.setup_name,
+        config.news_evaluator.confidence_threshold,
+    )
+    learned_threshold = perf_tracker.adjusted_threshold(signal.setup_name, base_threshold)
+    quality = _entry_signal_quality(signal, config)
+    if learned_threshold == base_threshold:
+        return True, quality, learned_threshold
+    return quality >= learned_threshold, quality, learned_threshold
+
+
+def _resolve_news_catalyst(client: AlpacaClient, symbol: str, config: Config, args=None) -> tuple[str, str]:
+    headline_override = (getattr(args, "catalyst_headline", "") or "").strip()
+    if headline_override:
+        return headline_override, "news"
+
+    try:
+        headlines = client.get_news(symbol, lookback_hours=config.scanner.news_lookback_hours)
+    except Exception:
+        return "", ""
+
+    if not headlines:
+        return "", ""
+    return str(headlines[0]), "news"
+
+
 def _exit_sell(client: AlpacaClient, symbol: str, qty: int, log: logging.Logger) -> None:
     quote = client.get_quote_with_spread(symbol)
     if quote["wide_spread"]:
         log.warning("%s: wide spread %.1f%% at exit", symbol, quote["spread_pct"])
-    log.info("%s: exit sell %d shares @ $%.2f (bid)", symbol, qty, quote["bid"])
+    log.info("%s: exit sell %d shares @ $%.2f (bid - $0.10)", symbol, qty, quote["bid"] - 0.10)
     client.place_exit_limit_order(symbol, qty, quote["bid"])
 
 
@@ -104,9 +188,21 @@ def _record_exit(
 # Position monitor loop                                               #
 # ------------------------------------------------------------------ #
 
+def _trailing_stop_pct(gain_pct: float) -> Optional[float]:
+    """Trail percentage based on current gain level; None = no trail yet."""
+    if gain_pct >= 0.60:
+        return 0.02
+    if gain_pct >= 0.40:
+        return 0.03
+    if gain_pct >= 0.20:
+        return 0.05
+    return None
+
+
 def monitor_position(
     *, client: AlpacaClient, risk_mgr: RiskManager, trade_logger: TradeLogger,
     config: Config, trade: TradeRecord, sizing: PositionSizing,
+    vwap: Optional[float] = None,
 ) -> None:
     log = logging.getLogger("monitor")
     symbol = trade.symbol
@@ -125,15 +221,22 @@ def monitor_position(
             return
         time.sleep(1)
 
-    targets = risk_mgr.calculate_targets(sizing.entry_price, sizing.initial_stop)
     shares_remaining = sizing.shares
-    t1_hit = False
+    breakeven_hit = False
+    r1_hit = False
+    exhaustion_hit = False
     last_candle_minute = None
     entry_bar_volume: Optional[float] = None
-    bars_since_entry: pd.DataFrame = pd.DataFrame()
 
-    log.info("%s: T1=$%.2f (2:1, sell 50%%) → breakeven stop → red-candle/extension exit",
-             symbol, targets.t1)
+    log.info(
+        "%s: breakeven=+%.0f%%  R1=+%.0f%%(or whole$) sell %.0f%%  exhaustion sell %.0f%%  "
+        "trail 20%%→5%% / 40%%→3%% / 60%%→2%%",
+        symbol,
+        config.risk.breakeven_gain_pct * 100,
+        config.risk.r1_gain_pct * 100,
+        config.risk.r1_sell_pct * 100,
+        config.risk.exhaustion_sell_pct * 100,
+    )
 
     while True:
         elapsed = time.monotonic() - start
@@ -148,94 +251,32 @@ def monitor_position(
             break
 
         current_price = float(position.current_price)
-        log.info("%s  price=$%.2f  stop=$%.2f  unrealized=$%+.2f  shares=%d  elapsed=%.0fm",
+        gain_pct = (current_price - sizing.entry_price) / sizing.entry_price
+
+        log.info("%s  price=$%.2f  stop=$%.2f  gain=%+.1f%%  shares=%d  elapsed=%.0fm",
                  symbol, current_price, current_stop,
-                 float(position.unrealized_pl), shares_remaining, elapsed / 60)
+                 gain_pct * 100, shares_remaining, elapsed / 60)
 
-        # ---- New completed 1-min candle check ----
-        current_minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-        if current_minute != last_candle_minute:
-            try:
-                bars = client.get_intraday_bars(symbol, lookback_hours=1)
-                last_candle_minute = current_minute
-                if not bars.empty:
-                    if entry_bar_volume is None:
-                        entry_bar_volume = float(bars["volume"].iloc[-1])
-                    bars_since_entry = bars
-                    atr = _compute_atr(bars)
+        # ---- Breakeven: stop → entry at +10% (no sell) ----
+        if not breakeven_hit and gain_pct >= config.risk.breakeven_gain_pct:
+            current_stop = sizing.entry_price
+            breakeven_hit = True
+            log.info("%s: +%.0f%% — stop moved to breakeven $%.2f",
+                     symbol, config.risk.breakeven_gain_pct * 100, current_stop)
 
-                    if len(bars) >= 2:
-                        completed = bars.iloc[-2]  # last COMPLETED candle (not in-progress)
-
-                        if t1_hit:
-                            # Red-candle exit
-                            if risk_mgr.is_red_candle(completed):
-                                log.info("%s: red-candle exit — selling %d shares", symbol, shares_remaining)
-                                _exit_sell(client, symbol, shares_remaining, log)
-                                trade.shares = shares_remaining
-                                _record_exit(trade=trade, exit_price=current_price,
-                                             reason="red_candle_exit",
-                                             trade_logger=trade_logger, client=client, symbol=symbol)
-                                break
-
-                            # Extension-bar exit
-                            if atr and risk_mgr.is_extension_bar(completed, atr):
-                                log.info("%s: extension-bar exit — selling %d shares", symbol, shares_remaining)
-                                _exit_sell(client, symbol, shares_remaining, log)
-                                trade.shares = shares_remaining
-                                _record_exit(trade=trade, exit_price=current_price,
-                                             reason="extension_bar_exit",
-                                             trade_logger=trade_logger, client=client, symbol=symbol)
-                                break
-
-                            # ATR trailing stop raise
-                            if atr:
-                                candidate = round(float(bars["low"].iloc[-2]) - atr * config.risk.atr_multiplier, 4)
-                                if current_stop < candidate < current_price:
-                                    log.info("%s: stop raised $%.2f → $%.2f", symbol, current_stop, candidate)
-                                    current_stop = candidate
-
-                        else:
-                            # Stall exit (before T1)
-                            if risk_mgr.is_stall(bars_since_entry, sizing.entry_price, targets.t1):
-                                log.info("%s: stall exit — no progress toward T1=$%.2f", symbol, targets.t1)
-                                _exit_sell(client, symbol, shares_remaining, log)
-                                trade.shares = shares_remaining
-                                _record_exit(trade=trade, exit_price=current_price,
-                                             reason="stall_exit",
-                                             trade_logger=trade_logger, client=client, symbol=symbol)
-                                break
-
-                            # Momentum-fail exit (before T1)
-                            if entry_bar_volume and risk_mgr.is_momentum_fail(bars, entry_bar_volume):
-                                log.info("%s: momentum-fail exit — volume collapsed", symbol)
-                                _exit_sell(client, symbol, shares_remaining, log)
-                                trade.shares = shares_remaining
-                                _record_exit(trade=trade, exit_price=current_price,
-                                             reason="momentum_fail_exit",
-                                             trade_logger=trade_logger, client=client, symbol=symbol)
-                                break
-
-            except Exception as exc:
-                log.warning("%s: bar fetch failed: %s", symbol, exc)
-
-        # ---- T1: sell 50% at 2:1, move stop to breakeven ----
-        if not t1_hit and current_price >= targets.t1:
-            t1_shares = shares_remaining // 2
-            if t1_shares > 0:
-                log.info("%s: T1 $%.2f — selling %d shares (50%%), stop → breakeven $%.2f",
-                         symbol, targets.t1, t1_shares, sizing.entry_price)
-                try:
-                    _exit_sell(client, symbol, t1_shares, log)
-                    shares_remaining -= t1_shares
-                    current_stop = sizing.entry_price
-                except Exception as exc:
-                    log.error("%s: T1 sell failed: %s", symbol, exc)
-            t1_hit = True
+        # ---- Trailing stop (active after R1 is hit) ----
+        if r1_hit:
+            trail_pct = _trailing_stop_pct(gain_pct)
+            if trail_pct is not None:
+                trail_stop = round(current_price * (1 - trail_pct), 4)
+                if trail_stop > current_stop:
+                    current_stop = trail_stop
+                    log.info("%s: trailing stop -> $%.2f (%.0f%% trail at %+.1f%% gain)",
+                             symbol, current_stop, trail_pct * 100, gain_pct * 100)
 
         # ---- Hard stop ----
         if risk_mgr.is_stop_hit(current_price, current_stop):
-            reason = "breakeven_stop" if t1_hit else "stop_loss"
+            reason = "breakeven_stop" if breakeven_hit else "stop_loss"
             log.warning("%s: %s price=$%.2f stop=$%.2f — closing %d shares",
                         symbol, reason, current_price, current_stop, shares_remaining)
             try:
@@ -246,6 +287,71 @@ def monitor_position(
             _record_exit(trade=trade, exit_price=current_price, reason=reason,
                          trade_logger=trade_logger, client=client, symbol=symbol)
             break
+
+        # ---- R1: sell 25% at first obvious resistance (every tick) ----
+        if not r1_hit and (
+            risk_mgr.is_near_whole_half_dollar(current_price)
+            or gain_pct >= config.risk.r1_gain_pct
+        ):
+            r1_shares = max(1, int(sizing.shares * config.risk.r1_sell_pct))
+            log.info("%s: R1 $%.2f — selling %d shares (%.0f%% of original)",
+                     symbol, current_price, r1_shares, config.risk.r1_sell_pct * 100)
+            try:
+                _exit_sell(client, symbol, r1_shares, log)
+                shares_remaining -= r1_shares
+            except Exception as exc:
+                log.error("%s: R1 sell failed: %s", symbol, exc)
+            r1_hit = True
+
+        # ---- Per-candle checks (exhaustion + big red exit) ----
+        current_minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        if current_minute != last_candle_minute:
+            try:
+                bars = client.get_intraday_bars(symbol, lookback_hours=1)
+                last_candle_minute = current_minute
+                if not bars.empty:
+                    if entry_bar_volume is None:
+                        entry_bar_volume = float(bars["volume"].iloc[-1])
+                    atr = _compute_atr(bars)
+
+                    if len(bars) >= 2:
+                        completed = bars.iloc[-2]
+
+                        # Exhaustion: sell 50% of remaining on first extension bar or volume climax
+                        if r1_hit and not exhaustion_hit:
+                            is_ext = bool(atr and risk_mgr.is_extension_bar(completed, atr))
+                            is_climax = bool(
+                                entry_bar_volume
+                                and risk_mgr.is_volume_climax(completed, entry_bar_volume)
+                            )
+                            if is_ext or is_climax:
+                                exh_reason = "extension_bar" if is_ext else "volume_climax"
+                                exh_shares = max(1, int(shares_remaining * config.risk.exhaustion_sell_pct))
+                                log.info(
+                                    "%s: exhaustion (%s) — selling %d shares (%.0f%% remaining)",
+                                    symbol, exh_reason, exh_shares,
+                                    config.risk.exhaustion_sell_pct * 100,
+                                )
+                                try:
+                                    _exit_sell(client, symbol, exh_shares, log)
+                                    shares_remaining -= exh_shares
+                                except Exception as exc:
+                                    log.error("%s: exhaustion sell failed: %s", symbol, exc)
+                                exhaustion_hit = True
+
+                        # Big red candle closing near its low → exit remainder
+                        if exhaustion_hit and risk_mgr.is_big_red_near_low(completed, atr):
+                            log.info("%s: big red near low — exiting %d remaining shares",
+                                     symbol, shares_remaining)
+                            _exit_sell(client, symbol, shares_remaining, log)
+                            trade.shares = shares_remaining
+                            _record_exit(trade=trade, exit_price=current_price,
+                                         reason="big_red_near_low",
+                                         trade_logger=trade_logger, client=client, symbol=symbol)
+                            break
+
+            except Exception as exc:
+                log.warning("%s: bar fetch failed: %s", symbol, exc)
 
         # ---- Max hold time ----
         if elapsed >= max_secs:
@@ -273,6 +379,7 @@ def run(
     skip_filters: bool = False,
     skip_entry_signal: bool = False,
     args=None,
+    strategy: str = "catalyst",
 ) -> None:
     log = logging.getLogger("run_bot")
 
@@ -283,19 +390,22 @@ def run(
         print(f"\n{symbol}: outside 7–11 AM ET trading window — no trade.\n")
         return
 
-    trade_logger = TradeLogger(config.log_dir)
+    trade_logger = TradeLogger(config.log_dir, strategy=strategy)
+    perf_tracker = PerformanceTracker(config.log_dir, strategy=strategy)
+    perf_stats = perf_tracker.get_stats()
     client = AlpacaClient(config)
-    strategy = PremarketCatalystStrategy(config, client)
+    strategy_impl = PremarketCatalystStrategy(config, client)
     risk_mgr = RiskManager(config)
 
     account = client.get_account()
     equity = float(account.equity)
+    starting_equity = float(account.last_equity) if account.last_equity else equity
     log.info("Paper account  equity=$%.2f  buying_power=$%.2f", equity, float(account.buying_power))
 
     # ---- Premarket filters ----------------------------------------
     if not skip_filters:
         log.info("=== Running premarket filters for %s ===", symbol)
-        filter_result = strategy.run_filters(symbol)
+        filter_result = strategy_impl.run_filters(symbol)
         print(f"\n[{symbol}] Filter results:\n{filter_result.summary()}")
         if not filter_result.passed:
             print(f"\n{symbol} did not pass all filters — no trade placed.\n")
@@ -346,6 +456,15 @@ def run(
             setup_results = run_setup_detectors(live_bars, pm_levels, filter_result.prev_close, session_open)
             active_setups = [(name, trig, stop_ref) for ok, name, trig, stop_ref in setup_results if ok]
             if active_setups:
+                ranked_setups = _rank_setups_by_learning(active_setups, perf_stats)
+                if ranked_setups[0][0] != active_setups[0][0]:
+                    log.info(
+                        "%s: learned setup selection preferred %s over %s",
+                        symbol,
+                        ranked_setups[0][0],
+                        active_setups[0][0],
+                    )
+                active_setups = ranked_setups
                 log.info("%s: confirmed setups: %s", symbol, [s[0] for s in active_setups])
     except Exception as exc:
         log.warning("%s: setup detection failed: %s", symbol, exc)
@@ -356,51 +475,25 @@ def run(
         trade_logger.print_summary()
         return
 
-    # ---- AI catalyst evaluation ----------------------------------
+    # ---- News catalyst confirmation ------------------------------
     catalyst_headline = ""
-    if not getattr(args, "no_catalyst_check", False) and config.news_evaluator.enabled:
-        try:
-            from news_evaluator import TradingAI
-            ai = TradingAI(config.news_evaluator)
-            headlines = client.get_news(symbol, lookback_hours=config.scanner.news_lookback_hours)
-            catalyst_headline = headlines[0] if headlines else ""
-            pattern_ctx = None
-            if pm_levels and active_setups:
-                mid = filter_result.price
-                pattern_ctx = PatternContext(
-                    setup_name=active_setups[0][0],
-                    pm_high=pm_levels.premarket_high,
-                    pm_low=pm_levels.premarket_low,
-                    vwap=pm_levels.vwap,
-                    current_price=mid,
-                    price_vs_vwap_pct=(mid - pm_levels.vwap) / pm_levels.vwap * 100 if pm_levels.vwap else 0,
-                    price_vs_pm_high_pct=(mid - pm_levels.premarket_high) / pm_levels.premarket_high * 100 if pm_levels.premarket_high else 0,
-                    active_setups=[s[0] for s in active_setups],
-                )
-            decision = ai.assess(
-                symbol=symbol, headlines=headlines,
-                filter_data={"rvol": filter_result.rvol, "gap_pct": filter_result.change_pct,
-                              "price": filter_result.price, "float_shares": filter_result.float_shares},
-                setup_name=active_setups[0][0] if active_setups else "",
-                pattern_ctx=pattern_ctx,
-            )
-            if not decision.should_trade:
-                log.info("%s: AI rejected  confidence=%.0f%%  quality=%s",
-                         symbol, decision.confidence * 100, decision.catalyst_quality)
-                print(f"\n{symbol}: AI rejected (confidence {decision.confidence:.0%}, {decision.catalyst_quality}) — no trade.\n")
-                return
-            log.info("%s: AI approved  confidence=%.0f%%  setup=%s  catalyst=%s",
-                     symbol, decision.confidence * 100, decision.setup_quality, decision.catalyst_type)
-        except ImportError:
-            log.warning("news_evaluator not available — skipping AI evaluation")
-        except Exception as exc:
-            log.warning("%s: AI evaluation failed (%s) — skipping", symbol, exc)
+    catalyst_type = ""
+    if not getattr(args, "no_catalyst_check", False) and strategy == "catalyst":
+        catalyst_headline, catalyst_type = _resolve_news_catalyst(client, symbol, config, args)
+        if not catalyst_headline:
+            print(f"\n{symbol}: no recent news catalyst found - no trade.\n")
+            trade_logger.print_summary()
+            return
+        log.info("%s: news catalyst confirmed - trading headline: %s", symbol, catalyst_headline)
+    else:
+        catalyst_headline = (getattr(args, "catalyst_headline", "") or "").strip()
+        catalyst_type = "news" if catalyst_headline else ""
 
     # ---- Entry signal confirmation --------------------------------
     setup_stop_ref: Optional[float] = active_setups[0][2] if active_setups else None
 
     if not skip_entry_signal:
-        signal = strategy.check_entry_signal(symbol, filter_result)
+        signal = strategy_impl.check_entry_signal(symbol, filter_result)
         if signal is None:
             print(f"\n{symbol}: entry signal not confirmed — no trade.\n")
             trade_logger.print_summary()
@@ -422,20 +515,43 @@ def run(
 
     log.info("%s: entry confirmed — setup=%s  reason=%s", symbol, signal.setup_name, signal.reason)
 
+    if not skip_entry_signal:
+        learned_ok, signal_quality, learned_threshold = _learned_entry_gate(signal, config, perf_tracker)
+        log.info(
+            "%s: learned entry gate setup=%s quality=%.0f%% threshold=%.0f%% pass=%s",
+            symbol,
+            signal.setup_name,
+            signal_quality * 100,
+            learned_threshold * 100,
+            learned_ok,
+        )
+        if not learned_ok:
+            print(
+                f"\n{symbol}: learned entry gate rejected {signal.setup_name} "
+                f"(quality {signal_quality:.0%} below learned threshold {learned_threshold:.0%}) - no trade.\n"
+            )
+            trade_logger.print_summary()
+            return
+
     # ---- Risk checks ---------------------------------------------
-    if not risk_mgr.check_max_daily_loss(equity, equity):
+    if not risk_mgr.check_max_daily_loss(starting_equity, equity):
         print("\nMax daily loss limit reached — no new trades.\n")
         return
 
-    atr = None
+    # Fetch entry candle low — Warrior stop = low of the entry bar
+    entry_bar_low = None
     try:
-        atr_bars = client.get_intraday_bars(symbol, lookback_hours=1)
-        if not atr_bars.empty:
-            atr = _compute_atr(atr_bars)
+        entry_bars = client.get_intraday_bars(symbol, lookback_hours=1)
+        if not entry_bars.empty:
+            entry_bar_low = float(entry_bars["low"].iloc[-1])
     except Exception:
         pass
 
-    sizing = risk_mgr.calculate_position_size(equity, signal.entry_price, atr=atr, setup_stop_ref=signal.setup_stop_ref)
+    sizing = risk_mgr.calculate_position_size(
+        equity, signal.entry_price,
+        entry_bar_low=entry_bar_low,
+        setup_stop_ref=signal.setup_stop_ref,
+    )
     log.info("Sizing  shares=%d  entry=$%.2f  stop=$%.2f  risk=$%.2f  value=$%.2f",
              sizing.shares, sizing.entry_price, sizing.initial_stop, sizing.risk_amount, sizing.position_value)
 
@@ -467,21 +583,28 @@ def run(
         shares=sizing.shares, initial_stop=sizing.initial_stop, trail_pct=0.0,
         rvol=signal.rvol, change_pct=signal.change_pct,
         setup_name=signal.setup_name, catalyst_headline=signal.catalyst_headline,
+        catalyst_type=catalyst_type, strategy=strategy,
     )
     trade_logger.log_entry(trade)
 
+    _r1 = round(signal.entry_price * (1 + config.risk.r1_gain_pct), 2)
+    _be = round(signal.entry_price * (1 + config.risk.breakeven_gain_pct), 2)
     print(
-        f"\n{'═' * 52}\n  PAPER TRADE ENTERED: {symbol}\n{'═' * 52}\n"
-        f"  Entry : ${signal.entry_price:.2f}  ×{sizing.shares} shares  = ${sizing.position_value:.2f}\n"
-        f"  Stop  : ${sizing.initial_stop:.2f}   Risk = ${sizing.risk_amount:.2f}\n"
-        f"  T1    : ${risk_mgr.calculate_targets(sizing.entry_price, sizing.initial_stop).t1:.2f} (2:1)\n"
-        f"  Setup : {signal.setup_name}\n{'═' * 52}\n"
+        f"\n{'=' * 52}\n  PAPER TRADE ENTERED: {symbol}\n{'=' * 52}\n"
+        f"  Entry      : ${signal.entry_price:.2f}  x{sizing.shares} shares  = ${sizing.position_value:.2f}\n"
+        f"  Stop       : ${sizing.initial_stop:.2f}   Risk = ${sizing.risk_amount:.2f}\n"
+        f"  Breakeven  : ${_be:.2f} (+{config.risk.breakeven_gain_pct:.0%}) → stop to entry, no sell\n"
+        f"  R1         : ${_r1:.2f} (+{config.risk.r1_gain_pct:.0%} or whole/$) → sell {config.risk.r1_sell_pct:.0%}\n"
+        f"  Exhaustion : sell {config.risk.exhaustion_sell_pct:.0%} remaining on ext-bar / vol-climax\n"
+        f"  Remainder  : big red near low OR 20→5%% / 40→3%% / 60→2%% trailing stop\n"
+        f"  Setup      : {signal.setup_name}\n{'=' * 52}\n"
     )
 
     # ---- Monitor position ----------------------------------------
     try:
         monitor_position(client=client, risk_mgr=risk_mgr, trade_logger=trade_logger,
-                         config=config, trade=trade, sizing=sizing)
+                         config=config, trade=trade, sizing=sizing,
+                         vwap=pm_levels.vwap if pm_levels else None)
     except KeyboardInterrupt:
         log.info("Interrupted — closing %s", symbol)
         try:

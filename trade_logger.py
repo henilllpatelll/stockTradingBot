@@ -4,7 +4,7 @@ import csv
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,16 @@ _FIELDS = [
     "change_pct",
     "setup_name",
     "catalyst_headline",
+    "catalyst_type",
+    "strategy",
 ]
+
+
+def _safe_float(val: str) -> Optional[float]:
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass
@@ -44,15 +53,17 @@ class TradeRecord:
     pnl_pct: Optional[float] = None
     setup_name: str = ""
     catalyst_headline: str = ""
+    catalyst_type: str = ""
+    strategy: str = "catalyst"
 
 
 class TradeLogger:
     """Appends entries to a CSV and updates them with exit data."""
 
-    def __init__(self, log_dir: str = "logs") -> None:
+    def __init__(self, log_dir: str = "logs", strategy: str = "catalyst") -> None:
         self._dir = Path(log_dir)
         self._dir.mkdir(exist_ok=True)
-        self._csv = self._dir / "trades.csv"
+        self._csv = self._dir / f"trades_{strategy}.csv"
         if not self._csv.exists():
             with open(self._csv, "w", newline="") as fh:
                 csv.DictWriter(fh, fieldnames=_FIELDS).writeheader()
@@ -120,9 +131,9 @@ class TradeLogger:
             print("No trades logged yet.")
             return
 
-        print(f"\n{'─' * 44}")
+        print(f"\n{'-' * 44}")
         print("  Paper Trade Summary")
-        print(f"{'─' * 44}")
+        print(f"{'-' * 44}")
         print(f"  Total trades  : {len(rows)}")
         print(f"  Open          : {len(open_trades)}")
         print(f"  Closed        : {len(closed)}")
@@ -141,7 +152,7 @@ class TradeLogger:
                 print(f"  Average loss  : ${sum(losses) / len(losses):+.2f}")
             print()
             print(f"  {'Symbol':<6}  {'Entry':>7}  {'Exit':>7}  {'PnL':>9}  Reason")
-            print(f"  {'─'*6}  {'─'*7}  {'─'*7}  {'─'*9}  {'─'*20}")
+            print(f"  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*9}  {'-'*20}")
             for r in closed[-10:]:
                 print(
                     f"  {r['symbol']:<6}  ${float(r['entry_price']):>6.2f}  "
@@ -149,4 +160,71 @@ class TradeLogger:
                     f"${float(r['pnl']):>+8.2f}  {r.get('exit_reason', '')}"
                 )
 
-        print(f"{'─' * 44}\n")
+        print(f"{'-' * 44}\n")
+
+
+class PerformanceTracker:
+    """Reads the trade CSV and computes win-rate stats for the learning feedback loop."""
+
+    _MIN_SAMPLE = 5    # trades needed before adjusting a threshold
+    _ADJUST_STEP = 0.07
+
+    def __init__(self, log_dir: str = "logs", strategy: str = "catalyst") -> None:
+        self._csv = Path(log_dir) / f"trades_{strategy}.csv"
+
+    def get_stats(self) -> Dict:
+        if not self._csv.exists():
+            return {}
+        with open(self._csv, newline="") as fh:
+            rows = [r for r in csv.DictReader(fh, restval="")
+                    if r.get("exit_price") and r.get("pnl")]
+        if not rows:
+            return {}
+
+        def _agg(key_field: str) -> Dict:
+            groups: Dict[str, List[float]] = {}
+            for r in rows:
+                key = r.get(key_field) or "unknown"
+                pnl = _safe_float(r.get("pnl", ""))
+                if pnl is None:
+                    continue
+                groups.setdefault(key, []).append(pnl)
+            out: Dict = {}
+            for k, pnls in groups.items():
+                wins = sum(1 for p in pnls if p > 0)
+                out[k] = {
+                    "trades": len(pnls),
+                    "wins": wins,
+                    "losses": len(pnls) - wins,
+                    "win_rate": wins / len(pnls),
+                    "avg_pnl": sum(pnls) / len(pnls),
+                }
+            return out
+
+        all_pnls = [_safe_float(r.get("pnl", "")) for r in rows]
+        all_pnls = [p for p in all_pnls if p is not None]
+        wins_all = sum(1 for p in all_pnls if p > 0)
+        return {
+            "overall": {
+                "trades": len(all_pnls),
+                "wins": wins_all,
+                "losses": len(all_pnls) - wins_all,
+                "win_rate": wins_all / len(all_pnls) if all_pnls else 0.0,
+                "avg_pnl": sum(all_pnls) / len(all_pnls) if all_pnls else 0.0,
+            },
+            "by_setup": _agg("setup_name"),
+            "by_catalyst": _agg("catalyst_type"),
+        }
+
+    def adjusted_threshold(self, setup_name: str, base: float) -> float:
+        """Raise/lower confidence threshold based on this setup's live win rate."""
+        stats = self.get_stats()
+        s = stats.get("by_setup", {}).get(setup_name, {})
+        if not s or s["trades"] < self._MIN_SAMPLE:
+            return base
+        wr = s["win_rate"]
+        if wr >= 0.65:
+            return max(base - self._ADJUST_STEP, 0.40)
+        if wr < 0.45:
+            return min(base + self._ADJUST_STEP, 0.92)
+        return base
